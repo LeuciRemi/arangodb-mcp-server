@@ -20,8 +20,9 @@ To be filled.
     - `databaseName` (string): The database to query
     - `aql` (string): The read-only AQL query to execute
   - Returns: Query results as array of objects
-- `readWriteQuery`
-  - Execute query on the database
+- `readWriteQuery` (opt-in)
+  - Execute query on the database (including writes)
+  - Disabled by default; enable it by starting the server with `--enable-write`
   - Input:
     - `databaseName` (string): The database to query
     - `aql` (string): The AQL query to execute
@@ -35,9 +36,13 @@ To be filled.
     - `databaseName` (string): The name of the database
   - Returns: Array of objects `{ "name": "<collectionName>" }`
 
+## Security
+
+By default, the `readWriteQuery` tool is **disabled** to prevent accidental data modifications. Only enable it with `--enable-write` when write operations are explicitly needed.
+
 ## Usage
 
-To connect to an arangodb instance running on localhost:2434, to the database "account", add the following to your `claude_desktop_config.json`, assuming the path to this project is `/home/yourcoolname/arango-mcp-server`:
+To connect to an arangodb instance running on localhost:8529, add the following to your `claude_desktop_config.json`:
 
 ```json
 {
@@ -47,6 +52,26 @@ To connect to an arangodb instance running on localhost:2434, to the database "a
       "args": [
         "-y",
         "arango-mcp-server",
+        "http://localhost:8529",
+        "root",
+        "root"
+      ]
+    }
+  }
+}
+```
+
+To enable write queries, add the `--enable-write` flag:
+
+```json
+{
+  "mcpServers": {
+    "arangodb-account": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "arango-mcp-server",
+        "--enable-write",
         "http://localhost:8529",
         "root",
         "root"

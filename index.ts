@@ -16,7 +16,7 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 const server = new Server(
   {
     name: "arango-mcp-server",
-    version: "0.1.0",
+    version: "1.0.0",
   },
   {
     capabilities: {
@@ -41,25 +41,67 @@ function debug(data: string) {
   });
 }
 
-const args = process.argv.slice(2);
-if (args.length < 1) {
-  console.error(
-    "Please provide a database URL"
-  );
-  process.exit(1);
+function printUsageAndExit(exitCode: 0 | 1): never {
+  const usage = [
+    "Usage:",
+    "  arango-mcp-server [--enable-write] <url> [username] [password]",
+    "",
+    "Arguments:",
+    "  url       ArangoDB base URL (e.g. http://localhost:8529)",
+    "  username  Optional username",
+    "  password  Optional password",
+    "",
+    "Flags:",
+    "  --enable-write  Expose and allow the readWriteQuery tool",
+    "  --help          Show this help",
+  ].join("\n");
+
+  // MCP servers typically log to stderr.
+  console.error(usage);
+  process.exit(exitCode);
+}
+
+const KNOWN_FLAGS = new Set(["--enable-write", "--help"]);
+
+const rawArgs = process.argv.slice(2);
+const flags = new Set<string>();
+const positionals: string[] = [];
+
+for (const arg of rawArgs) {
+  if (arg.startsWith("--")) {
+    if (!KNOWN_FLAGS.has(arg)) {
+      console.error(`Unknown flag: ${arg}`);
+      printUsageAndExit(1);
+    }
+    flags.add(arg);
+  } else {
+    positionals.push(arg);
+  }
+}
+
+if (flags.has("--help")) {
+  printUsageAndExit(0);
+}
+
+const enableWrite = flags.has("--enable-write");
+
+if (positionals.length < 1) {
+  console.error("Please provide a database URL");
+  printUsageAndExit(1);
 }
 
 // Database URL should be in the format:
 // "http://localhost:8529"
-const databaseUrl = args[0];
+const databaseUrl = positionals[0];
 
-const username = args.length > 1 ? args[1] : undefined;
-const password = args.length > 2 ? args[2] : undefined;
+const username = positionals.length > 1 ? positionals[1] : undefined;
+const password = positionals.length > 2 ? positionals[2] : undefined;
 
 const auth = username && password ? { username, password } : undefined;
 
 console.error("databaseUrl: " + databaseUrl);
 console.error("auth: " + JSON.stringify(auth));
+console.error("enableWrite: " + enableWrite);
 
 const resourceBaseUrl = new URL(databaseUrl);
 
@@ -70,17 +112,21 @@ const db = new Database({
 
 async function getCollections(db: Database): Promise<CollectionType[]> {
   const cursor = await db.query(aql`
-    RETURN COLLECTIONS()
+    FOR collection IN COLLECTIONS()
+    FILTER !STARTS_WITH(collection.name, "_")
+    RETURN {
+      _id: collection._id,
+      name: collection.name
+    }
   `);
 
   const result = await cursor.all();
   const allCollections: Array<CollectionType> = [];
 
-  for (const collectionArray of result) {
-    for (const collection of collectionArray) {
-      allCollections.push(collectionSchema.parse(collection));
-    }
+  for (const collection of result) {
+    allCollections.push(collectionSchema.parse(collection));
   }
+  
   return allCollections;
 }
 
@@ -260,30 +306,34 @@ function getOrCreateDatabaseConnection(databaseName: string): Database {
 }
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: ToolName.READ_QUERY,
-        description: "Run a read-only AQL query",
-        inputSchema: zodToJsonSchema(readQuerySchema),
-      },
-      {
-        name: ToolName.READ_WRITE_QUERY,
-        description: "Run an AQL query",
-        inputSchema: zodToJsonSchema(readWriteQuerySchema),
-      },
-      {
-        name: ToolName.LIST_DATABASES,
-        description: "List all the databases",
-        inputSchema: zodToJsonSchema(listDatabasesSchema),
-      },
-      {
-        name: ToolName.LIST_COLLECTIONS,
-        description: "List all the collections in a database",
-        inputSchema: zodToJsonSchema(listCollectionsSchema),
-      }
-    ],
-  };
+  const tools = [
+    {
+      name: ToolName.READ_QUERY,
+      description: "Run a read-only AQL query",
+      inputSchema: zodToJsonSchema(readQuerySchema),
+    },
+    ...(enableWrite
+      ? [
+          {
+            name: ToolName.READ_WRITE_QUERY,
+            description: "Run an AQL query",
+            inputSchema: zodToJsonSchema(readWriteQuerySchema),
+          },
+        ]
+      : []),
+    {
+      name: ToolName.LIST_DATABASES,
+      description: "List all the databases",
+      inputSchema: zodToJsonSchema(listDatabasesSchema),
+    },
+    {
+      name: ToolName.LIST_COLLECTIONS,
+      description: "List all the collections in a database",
+      inputSchema: zodToJsonSchema(listCollectionsSchema),
+    },
+  ];
+
+  return { tools };
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -298,13 +348,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       const aql = request.params.arguments?.aql as string;
 
-      const allCollections = await getCollections(dbConnector);
-
-      const tx = await dbConnector.beginTransaction({
-        read: allCollections.map((collection) => collection.name),
-      });
-
-      const cursor = await tx.step(() => dbConnector.query(aql));
+      // Execute read query directly without transaction
+      const cursor = await dbConnector.query(aql);
 
       const result = await cursor.all();
 
@@ -313,18 +358,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         isError: false,
       };
     } else if (request.params.name === ToolName.READ_WRITE_QUERY) {
-      const dbConnector = getOrCreateDatabaseConnection(request.params.arguments?.databaseName as string);
+      if (!enableWrite) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Tool readWriteQuery is disabled. Start the server with --enable-write to allow write queries.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const dbConnector = getOrCreateDatabaseConnection(
+        request.params.arguments?.databaseName as string
+      );
 
       const aql = request.params.arguments?.aql as string;
 
-      const allCollections = await getCollections(dbConnector);
-
-      const tx = await dbConnector.beginTransaction({
-        read: allCollections.map((collection) => collection.name),
-        write: allCollections.map((collection) => collection.name),
-      });
-
-      const cursor = await tx.step(() => dbConnector.query(aql));
+      // Execute write query directly without transaction
+      // Transactions should be handled in the AQL query itself if needed
+      const cursor = await dbConnector.query(aql);
 
       const result = await cursor.all();
 
