@@ -51,7 +51,7 @@ To connect to an arangodb instance running on localhost:8529, add the following 
       "command": "npx",
       "args": [
         "-y",
-        "arango-mcp-server",
+        "arangodb-mcp-server",
         "http://localhost:8529",
         "root",
         "root"
@@ -70,7 +70,7 @@ To enable write queries, add the `--enable-write` flag:
       "command": "npx",
       "args": [
         "-y",
-        "arango-mcp-server",
+        "arangodb-mcp-server",
         "--enable-write",
         "http://localhost:8529",
         "root",
@@ -99,16 +99,17 @@ Go to http://localhost:5173/ to see the inspector.
 
 ## Todo
 
-- [ ] Properly study the spec to see if the current implementation of resources actually make sense (I don't think it does)
+- [x] Properly study the spec to see if the current implementation of resources actually make sense
   - [x] The resource templates make sense
-- [ ] Change all the "arango" to "arangodb" (repo name included...)
-- [ ] Add back the arangodb password
+- [x] Change all the "arango" to "arangodb" (repo name included...)
+- [x] Add back the arangodb password
+- [x] Migrate from deprecated `Server` to `McpServer` API
 - [ ] Proper README
   - [ ] Tools/resource/etc following the format of the official anthropic stuff
 - [ ] Figure out notifications
 - [ ] Health checks
 - [ ] More tools?
-- [ ] Access all the databases running on an arangodb instance
+- [x] Access all the databases running on an arangodb instance
 - [ ] Release on npm somehow so it can be used with `npx`
 - [ ] `resources/subscribe` and `notifications/resources/list_changed` and `resources/unsubscribe`
 - [x] Properly document tools in the readme

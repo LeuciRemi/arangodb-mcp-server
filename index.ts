@@ -1,50 +1,14 @@
 #!/usr/bin/env node
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListResourcesRequestSchema,
-  ListResourceTemplatesRequestSchema,
-  ListToolsRequestSchema,
-  ReadResourceRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
 import { Database, aql } from "arangojs";
 import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
-
-const server = new Server(
-  {
-    name: "arango-mcp-server",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      logging: {},
-      resources: {},
-      tools: {},
-    },
-  }
-);
-
-function info(data: string) {
-  server.sendLoggingMessage({
-    level: "info",
-    data: data,
-  });
-}
-
-function debug(data: string) {
-  server.sendLoggingMessage({
-    level: "debug",
-    data: data,
-  });
-}
 
 function printUsageAndExit(exitCode: 0 | 1): never {
   const usage = [
     "Usage:",
-    "  arango-mcp-server [--enable-write] <url> [username] [password]",
+    "  arangodb-mcp-server [--enable-write] <url> [username] [password]",
     "",
     "Arguments:",
     "  url       ArangoDB base URL (e.g. http://localhost:8529)",
@@ -99,37 +63,41 @@ const password = positionals.length > 2 ? positionals[2] : undefined;
 
 const auth = username && password ? { username, password } : undefined;
 
-console.error("databaseUrl: " + databaseUrl);
-console.error("auth: " + JSON.stringify(auth));
-console.error("enableWrite: " + enableWrite);
-
-const resourceBaseUrl = new URL(databaseUrl);
-
 const db = new Database({
   url: databaseUrl,
   auth: auth,
-})
+});
 
-async function getCollections(db: Database): Promise<CollectionType[]> {
-  const cursor = await db.query(aql`
-    FOR collection IN COLLECTIONS()
-    FILTER !STARTS_WITH(collection.name, "_")
-    RETURN {
-      _id: collection._id,
-      name: collection.name
-    }
-  `);
-
-  const result = await cursor.all();
-  const allCollections: Array<CollectionType> = [];
-
-  for (const collection of result) {
-    allCollections.push(collectionSchema.parse(collection));
+// Create the McpServer instance
+const server = new McpServer(
+  {
+    name: "arangodb-mcp-server",
+    version: "1.0.0",
+  },
+  {
+    capabilities: {
+      logging: {},
+      resources: {},
+      tools: {},
+    },
   }
-  
-  return allCollections;
+);
+
+function debug(data: string) {
+  server.server.sendLoggingMessage({
+    level: "debug",
+    data: data,
+  });
 }
 
+function error(data: string) {
+  server.server.sendLoggingMessage({
+    level: "error",
+    data: data,
+  });
+}
+
+// Collection schema for parsing
 const collectionSchema = z
   .object({
     _id: z.string(),
@@ -139,155 +107,7 @@ const collectionSchema = z
 
 type CollectionType = z.infer<typeof collectionSchema>;
 
-server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  server.sendLoggingMessage({
-    level: "debug",
-    data: `ListResourcesRequestSchema with url ${databaseUrl}`,
-  });
-
-  const allCollections = await getCollections(db);
-
-  console.error("collections: " + allCollections);
-  console.error("collections:" + JSON.stringify(allCollections));
-
-  return {
-    resources: allCollections.map((collection) => ({
-      uri: new URL(`${resourceBaseUrl}/_api/document/${collection.name}`),
-      mimeType: "application/json",
-      name: `"${collection.name}" http endpoint`,
-    })),
-  };
-});
-
-server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
-  return {
-    resourceTemplates: [
-      {
-        uriTemplate: "arangodb:///{database}/{collection}/{documentID}",
-        name: "ArangoDB document",
-        mimeType: "application/json",
-        description: "A document in an ArangoDB collection",
-      },
-    ],
-  };
-});
-
-interface ArangoDBURI {
-  databaseName: string;
-  collectionName: string;
-  documentId: string;
-}
-
-class InvalidArangoDBURIError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "InvalidArangoDBURIError";
-  }
-}
-
-/**
- * Parses and validates an ArangoDB URI string of the format:
- * arangodb:///databaseName/collectionName/documentID
- *
- * @param uri The ArangoDB URI string to parse
- * @returns An object containing the parsed components
- * @throws InvalidArangoDBURIError if the URI format is invalid
- */
-export function parseArangoDBURI(uri: string): ArangoDBURI {
-  // Check if the string starts with the correct prefix
-  if (!uri.startsWith("arangodb:///")) {
-    throw new InvalidArangoDBURIError('URI must start with "arangodb:///"');
-  }
-
-  // Remove the prefix and split the remaining path
-  const path = uri.slice("arangodb:///".length);
-  const components = path.split("/");
-
-  // Validate we have exactly 3 components
-  if (components.length !== 3) {
-    throw new InvalidArangoDBURIError(
-      "URI must have exactly three components: databaseName/collectionName/documentId"
-    );
-  }
-
-  // Validate each component is non-empty
-  const [databaseName, collectionName, documentId] = components;
-
-  if (!databaseName) {
-    throw new InvalidArangoDBURIError("Database name cannot be empty");
-  }
-
-  if (!collectionName) {
-    throw new InvalidArangoDBURIError("Collection name cannot be empty");
-  }
-
-  if (!documentId) {
-    throw new InvalidArangoDBURIError("Document ID cannot be empty");
-  }
-
-  // Optional: Add additional validation for component formats if needed
-  // For example, checking for valid characters, length limits, etc.
-
-  return {
-    databaseName,
-    collectionName,
-    documentId,
-  };
-}
-
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  const uri = request.params.uri;
-  const arangodbURI = parseArangoDBURI(uri);
-
-  const db = new Database({
-    url: databaseUrl,
-    databaseName: arangodbURI.databaseName,
-    auth: auth,
-  });
-
-  try {
-    const document = await db
-      .collection(arangodbURI.collectionName)
-      .document(arangodbURI.documentId);
-
-    return {
-      contents: [
-        {
-          uri,
-          mimeType: "application/json",
-          text: JSON.stringify(document),
-        },
-      ],
-    };
-  } catch (error) {
-    console.error("error: " + error);
-    throw error;
-  }
-});
-
-const readQuerySchema = z.object({
-  databaseName: z.string(),
-  aql: z.string(),
-});
-
-const readWriteQuerySchema = z.object({
-  databaseName: z.string(),
-  aql: z.string(),
-});
-
-const listDatabasesSchema = z.object({});
-
-const listCollectionsSchema = z.object({
-  databaseName: z.string(),
-})
-
-enum ToolName {
-  READ_QUERY = "readQuery",
-  READ_WRITE_QUERY = "readWriteQuery",
-  LIST_DATABASES = "listDatabases",
-  LIST_COLLECTIONS = "listCollections",
-}
-
+// Database connection pool
 const databaseConnections = new Map<string, Database>();
 
 function getOrCreateDatabaseConnection(databaseName: string): Database {
@@ -305,131 +125,325 @@ function getOrCreateDatabaseConnection(databaseName: string): Database {
   return dbConnector;
 }
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const tools = [
-    {
-      name: ToolName.READ_QUERY,
-      description: "Run a read-only AQL query",
-      inputSchema: zodToJsonSchema(readQuerySchema),
-    },
-    ...(enableWrite
-      ? [
-          {
-            name: ToolName.READ_WRITE_QUERY,
-            description: "Run an AQL query",
-            inputSchema: zodToJsonSchema(readWriteQuerySchema),
-          },
-        ]
-      : []),
-    {
-      name: ToolName.LIST_DATABASES,
-      description: "List all the databases",
-      inputSchema: zodToJsonSchema(listDatabasesSchema),
-    },
-    {
-      name: ToolName.LIST_COLLECTIONS,
-      description: "List all the collections in a database",
-      inputSchema: zodToJsonSchema(listCollectionsSchema),
-    },
-  ];
-
-  return { tools };
-});
-
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  server.sendLoggingMessage({
-    level: "debug",
-    data: `CallToolRequest with name ${request.params.name}`,
-  })
-
-  try {
-    if (request.params.name === ToolName.READ_QUERY) {
-      const dbConnector = getOrCreateDatabaseConnection(request.params.arguments?.databaseName as string);
-
-      const aql = request.params.arguments?.aql as string;
-
-      // Execute read query directly without transaction
-      const cursor = await dbConnector.query(aql);
-
-      const result = await cursor.all();
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        isError: false,
-      };
-    } else if (request.params.name === ToolName.READ_WRITE_QUERY) {
-      if (!enableWrite) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Tool readWriteQuery is disabled. Start the server with --enable-write to allow write queries.",
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      const dbConnector = getOrCreateDatabaseConnection(
-        request.params.arguments?.databaseName as string
-      );
-
-      const aql = request.params.arguments?.aql as string;
-
-      // Execute write query directly without transaction
-      // Transactions should be handled in the AQL query itself if needed
-      const cursor = await dbConnector.query(aql);
-
-      const result = await cursor.all();
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        isError: false,
-      };
-    } else if (request.params.name === ToolName.LIST_DATABASES) {
-      server.sendLoggingMessage({
-        level: "debug",
-        data: `listDatabases`,
-      })
-
-      const allDatabases = await db.databases();
-
-      return {
-        content: [{
-          type: "text", text: JSON.stringify(allDatabases.map(database => {
-            return {
-              name: database.name,
-            }
-          }), null, 2)
-        }],
-        isError: false,
-      };
-    } else if (request.params.name === ToolName.LIST_COLLECTIONS) {
-      const dbConnector = getOrCreateDatabaseConnection(request.params.arguments?.databaseName as string);
-      const allCollections = await getCollections(dbConnector);
-
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(allCollections.map(collection => ({
-            name: collection.name
-          })), null, 2)
-        }],
-        isError: false,
-      };
+async function getCollections(db: Database): Promise<CollectionType[]> {
+  const cursor = await db.query(aql`
+    FOR collection IN COLLECTIONS()
+    FILTER !STARTS_WITH(collection.name, "_")
+    RETURN {
+      _id: collection._id,
+      name: collection.name
     }
-  } catch (error) {
-    server.sendLoggingMessage({
-      level: "error",
-      data: `Error: ${error}`,
-    })
+  `);
 
-    console.error("error inside the CallToolRequestSchema: " + error);
-    throw error;
+  const result = await cursor.all();
+  const allCollections: Array<CollectionType> = [];
+
+  for (const collection of result) {
+    allCollections.push(collectionSchema.parse(collection));
   }
 
-  throw new Error("Unknown tool");
-});
+  return allCollections;
+}
+
+// ============================================
+// URI Parsing for Resources
+// ============================================
+
+interface ArangoDBCollectionURI {
+  type: "collection";
+  databaseName: string;
+  collectionName: string;
+}
+
+interface ArangoDBDocumentURI {
+  type: "document";
+  databaseName: string;
+  collectionName: string;
+  documentId: string;
+}
+
+type ArangoDBURI = ArangoDBCollectionURI | ArangoDBDocumentURI;
+
+class InvalidArangoDBURIError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidArangoDBURIError";
+  }
+}
+
+/**
+ * Parses and validates an ArangoDB URI string of the format:
+ * - arangodb:///databaseName/collectionName (collection)
+ * - arangodb:///databaseName/collectionName/documentID (document)
+ *
+ * @param uri The ArangoDB URI string to parse
+ * @returns An object containing the parsed components
+ * @throws InvalidArangoDBURIError if the URI format is invalid
+ */
+export function parseArangoDBURI(uri: string): ArangoDBURI {
+  // Check if the string starts with the correct prefix
+  if (!uri.startsWith("arangodb:///")) {
+    throw new InvalidArangoDBURIError('URI must start with "arangodb:///"');
+  }
+
+  // Remove the prefix and split the remaining path
+  const path = uri.slice("arangodb:///".length);
+  const components = path.split("/");
+
+  // Validate we have 2 or 3 components
+  if (components.length < 2 || components.length > 3) {
+    throw new InvalidArangoDBURIError(
+      "URI must have 2 or 3 components: databaseName/collectionName[/documentId]"
+    );
+  }
+
+  const [databaseName, collectionName, documentId] = components;
+
+  if (!databaseName) {
+    throw new InvalidArangoDBURIError("Database name cannot be empty");
+  }
+
+  if (!collectionName) {
+    throw new InvalidArangoDBURIError("Collection name cannot be empty");
+  }
+
+  if (components.length === 2) {
+    return {
+      type: "collection",
+      databaseName,
+      collectionName,
+    };
+  }
+
+  if (!documentId) {
+    throw new InvalidArangoDBURIError("Document ID cannot be empty");
+  }
+
+  return {
+    type: "document",
+    databaseName,
+    collectionName,
+    documentId,
+  };
+}
+
+// ============================================
+// Resource Templates Registration
+// ============================================
+
+// Collection resource template
+server.registerResource(
+  "ArangoDB collection",
+  new ResourceTemplate("arangodb:///{database}/{collection}", {
+    list: async () => {
+      debug(`Listing all collections across databases`);
+
+      const allDatabases = await db.databases();
+      const userDatabases = allDatabases.filter(d => d.name !== "_system");
+
+      const collectionsPerDb = await Promise.all(
+        userDatabases.map(async (database) => {
+          const dbConnection = getOrCreateDatabaseConnection(database.name);
+          const collections = await getCollections(dbConnection);
+          return { database, collections };
+        })
+      );
+
+      const resources = collectionsPerDb.flatMap(({ database, collections }) =>
+        collections.map((collection) => ({
+          uri: `arangodb:///${database.name}/${collection.name}`,
+          mimeType: "application/json",
+          name: `${database.name}/${collection.name}`,
+          description: `Collection "${collection.name}" in database "${database.name}"`,
+        }))
+      );
+
+      return { resources };
+    },
+  }),
+  {
+    mimeType: "application/json",
+    description: "A collection in an ArangoDB database with document count and sample documents",
+  },
+  async (uri, variables) => {
+    const database = variables.database as string;
+    const collection = variables.collection as string;
+
+    debug(`Reading collection resource: ${database}/${collection}`);
+
+    const dbConnection = getOrCreateDatabaseConnection(database);
+    const collectionHandle = dbConnection.collection(collection);
+
+    const [countResult, cursor] = await Promise.all([
+      collectionHandle.count(),
+      dbConnection.query(aql`
+        FOR doc IN ${collectionHandle}
+        LIMIT 10
+        RETURN doc
+      `),
+    ]);
+    const sampleDocs = await cursor.all();
+
+    return {
+      contents: [
+        {
+          uri: uri.href,
+          mimeType: "application/json",
+          text: JSON.stringify({
+            collection: collection,
+            database: database,
+            documentCount: countResult.count,
+            sampleDocuments: sampleDocs,
+          }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+// Document resource template
+server.registerResource(
+  "ArangoDB document",
+  new ResourceTemplate("arangodb:///{database}/{collection}/{documentID}", {
+    list: undefined, // Documents are accessed directly, not listed
+  }),
+  {
+    mimeType: "application/json",
+    description: "A document in an ArangoDB collection",
+  },
+  async (uri, variables) => {
+    const database = variables.database as string;
+    const collection = variables.collection as string;
+    const documentID = variables.documentID as string;
+
+    debug(`Reading document resource: ${database}/${collection}/${documentID}`);
+
+    const dbConnection = getOrCreateDatabaseConnection(database);
+
+    try {
+      const document = await dbConnection
+        .collection(collection)
+        .document(documentID);
+
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(document, null, 2),
+          },
+        ],
+      };
+    } catch (err) {
+      error(`Error reading document ${uri.href}: ${err}`);
+      throw err;
+    }
+  }
+);
+
+// ============================================
+// Tools Registration
+// ============================================
+
+// readQuery tool
+server.registerTool(
+  "readQuery",
+  {
+    description: "Run a read-only AQL query",
+    inputSchema: {
+      databaseName: z.string().describe("The database to query"),
+      aql: z.string().describe("The read-only AQL query to execute"),
+    },
+  },
+  async ({ databaseName, aql: aqlQuery }) => {
+    debug(`readQuery on ${databaseName}: ${aqlQuery}`);
+
+    const dbConnector = getOrCreateDatabaseConnection(databaseName);
+    const cursor = await dbConnector.query(aqlQuery);
+    const result = await cursor.all();
+
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    };
+  }
+);
+
+// readWriteQuery tool (conditionally registered)
+if (enableWrite) {
+  server.registerTool(
+    "readWriteQuery",
+    {
+      description: "Run an AQL query (including writes)",
+      inputSchema: {
+        databaseName: z.string().describe("The database to query"),
+        aql: z.string().describe("The AQL query to execute"),
+      },
+    },
+    async ({ databaseName, aql: aqlQuery }) => {
+      debug(`readWriteQuery on ${databaseName}: ${aqlQuery}`);
+
+      const dbConnector = getOrCreateDatabaseConnection(databaseName);
+      const cursor = await dbConnector.query(aqlQuery);
+      const result = await cursor.all();
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    }
+  );
+}
+
+// listDatabases tool
+server.registerTool(
+  "listDatabases",
+  {
+    description: "List all the databases",
+  },
+  async () => {
+    debug("listDatabases");
+
+    const allDatabases = await db.databases();
+
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify(allDatabases.map(database => ({
+          name: database.name,
+        })), null, 2)
+      }],
+    };
+  }
+);
+
+// listCollections tool
+server.registerTool(
+  "listCollections",
+  {
+    description: "List all the collections in a database",
+    inputSchema: {
+      databaseName: z.string().describe("The name of the database"),
+    },
+  },
+  async ({ databaseName }) => {
+    debug(`listCollections for ${databaseName}`);
+
+    const dbConnector = getOrCreateDatabaseConnection(databaseName);
+    const allCollections = await getCollections(dbConnector);
+
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify(allCollections.map(collection => ({
+          name: collection.name
+        })), null, 2)
+      }],
+    };
+  }
+);
+
+// ============================================
+// Server Startup
+// ============================================
 
 async function runServer() {
   const transport = new StdioServerTransport();
