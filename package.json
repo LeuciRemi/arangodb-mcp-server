@@ -1,39 +1,67 @@
 {
   "name": "arangodb-mcp-server",
-  "version": "1.0.0",
-  "description": "MCP server for interacting with ArangoDB databases. For more information about the Model Context Protocol, visit https://modelcontextprotocol.io",
+  "version": "2.0.0",
+  "description": "Safe, bounded Model Context Protocol server for exploring and querying ArangoDB databases",
   "license": "MIT",
   "author": "Lucas DE ANGELIS <deangelis.lucas@outlook.com>",
-  "bugs": "https://github.com/lucas-deangelis/arangodb-mcp-server/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LeuciRemi/arangodb-mcp-server.git"
+  },
+  "homepage": "https://github.com/LeuciRemi/arangodb-mcp-server#readme",
+  "bugs": "https://github.com/LeuciRemi/arangodb-mcp-server/issues",
+  "keywords": [
+    "arangodb",
+    "mcp",
+    "model-context-protocol",
+    "aql"
+  ],
   "type": "module",
   "bin": {
     "arangodb-mcp-server": "dist/index.js"
   },
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md"
   ],
   "scripts": {
+    "clean": "shx rm -rf dist",
     "generate-data": "node dev/generate-ecommerce-data.cjs && node dev/generate-library-data.cjs",
     "docker:build": "docker build -t arangodb-for-arangodb-mcp-server dev",
-    "docker:run": "docker run -p 8529:8529 -d --name arangodb-for-arangodb-mcp-server-dev arangodb-for-arangodb-mcp-server",
+    "docker:run": "docker run -p 127.0.0.1:18529:8529 -e ARANGO_ROOT_PASSWORD=root -d --name arangodb-for-arangodb-mcp-server-dev arangodb-for-arangodb-mcp-server",
     "docker:stop": "docker stop arangodb-for-arangodb-mcp-server-dev",
     "docker:remove": "docker rm arangodb-for-arangodb-mcp-server-dev",
     "dev:setup": "npm run generate-data && npm run docker:build && npm run docker:run",
     "dev:teardown": "npm run docker:stop && npm run docker:remove",
     "dev": "nodemon",
-    "build": "tsc && shx chmod +x dist/*.js"
+    "build": "npm run clean && tsc && shx chmod +x dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run test:unit",
+    "test:unit": "npm run build && node --test test/unit/*.test.mjs",
+    "test:integration": "npm run build && node --test test/integration/*.test.mjs",
+    "test:integration:docker": "node test/run-integration-docker.mjs",
+    "test:package": "node test/smoke-package.mjs",
+    "check": "npm run typecheck && npm run test:unit",
+    "prepack": "npm run build"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.1",
-    "arangojs": "^10.1.2",
-    "zod": "^3.25.76",
-    "zod-to-json-schema": "^3.24.1"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "arangojs": "^10.3.1",
+    "zod": "^4.4.3"
+  },
+  "overrides": {
+    "@hono/node-server": "2.0.12",
+    "fast-uri": "3.1.5"
   },
   "devDependencies": {
-    "nodemon": "^3.1.9",
+    "nodemon": "^3.1.14",
     "shx": "^0.4.0",
-    "typescript": "^5.6.2"
+    "typescript": "^7.0.2"
   }
 }

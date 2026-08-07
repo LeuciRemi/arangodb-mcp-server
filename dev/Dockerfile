@@ -1,4 +1,4 @@
-FROM arangodb:latest
+FROM arangodb:3.12
 
 # Collections that will be loaded in the databases.
 # See the readme for generation instructions.
@@ -10,11 +10,8 @@ COPY ./data /docker-entrypoint-initdb.d/data/
 # thanks to the /docker-entrypoint-initdb.d/ directory
 COPY ./init.js /docker-entrypoint-initdb.d/
 
-# ENV ARANGO_ROOT_PASSWORD=root
-ENV ARANGO_ROOT_PASSWORD=root
-
 # Default arangodb port
 EXPOSE 8529
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-  CMD curl -f http://localhost:8529/_api/version || exit 1
+  CMD-SHELL curl -fsS -u "root:${ARANGO_ROOT_PASSWORD}" http://localhost:8529/_api/version || exit 1

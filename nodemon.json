@@ -1,5 +1,5 @@
 {
-  "watch": ["index.ts"],
-  "exec": "tsc && npx @modelcontextprotocol/inspector node dist/index.js http://localhost:8529 root root",
+  "watch": ["index.ts", "src"],
+  "exec": "npm run build && ARANGO_URL=http://127.0.0.1:18529 ARANGO_USERNAME=root ARANGO_PASSWORD=root npx --yes @modelcontextprotocol/inspector@0.22.0 node dist/index.js",
   "ext": "ts"
 }
