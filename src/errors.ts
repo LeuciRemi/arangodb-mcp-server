@@ -31,7 +31,7 @@ function errorFields(error: unknown): {
   };
 }
 
-function redact(value: string, config: ServerConfig): string {
+export function redactErrorMessage(value: string, config: ServerConfig): string {
   let redacted = value;
   for (const secret of [config.password, config.username]) {
     if (secret) {
@@ -49,7 +49,7 @@ function redact(value: string, config: ServerConfig): string {
 
 export function publicErrorMessage(error: unknown, config: ServerConfig): string {
   if (error instanceof UserFacingError) {
-    return error.message;
+    return redactErrorMessage(error.message, config);
   }
   const fields = errorFields(error);
   const prefix = fields.errorNum
@@ -58,5 +58,5 @@ export function publicErrorMessage(error: unknown, config: ServerConfig): string
       ? `ArangoDB request failed (${fields.code})`
       : "ArangoDB request failed";
   const detail = fields.message ? `: ${fields.message}` : "";
-  return redact(`${prefix}${detail}`, config);
+  return redactErrorMessage(`${prefix}${detail}`, config);
 }

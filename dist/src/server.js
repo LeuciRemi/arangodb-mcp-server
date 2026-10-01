@@ -3,8 +3,35 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { ArangoDBService } from "./arangodb-service.js";
-import { publicErrorMessage } from "./errors.js";
-import { boundedObjectResult, boundedQueryPageResult } from "./mcp-content.js";
+import { publicErrorMessage, redactErrorMessage } from "./errors.js";
+import { boundedObjectResult, boundedQueryPageResult, boundedToolErrorResult, } from "./mcp-content.js";
+class BoundedErrorMcpServer extends McpServer {
+    config;
+    constructor(config, ...args) {
+        super(...args);
+        this.config = config;
+    }
+    async connect(transport) {
+        // The SDK creates validation errors before invoking tool callbacks. Apply the
+        // same limit at the owned transport boundary so these errors are covered too.
+        const send = transport.send.bind(transport);
+        transport.send = (message, options) => {
+            if ("result" in message && message.result.isError === true) {
+                const content = Array.isArray(message.result.content) ? message.result.content : [];
+                const text = content
+                    .filter((item) => item && item.type === "text" && typeof item.text === "string")
+                    .map((item) => item.text)
+                    .join("\n");
+                message = {
+                    ...message,
+                    result: boundedToolErrorResult(redactErrorMessage(text || "Tool request failed", this.config), this.config.maxBytes),
+                };
+            }
+            return send(message, options);
+        };
+        await super.connect(transport);
+    }
+}
 const warningSchema = z.object({
     code: z.number().int(),
     message: z.string(),
@@ -39,6 +66,25 @@ function resourceText(value, uri, maxBytes) {
         throw new McpError(ErrorCode.InternalError, `Complete MCP resource response is ${bytes} bytes and exceeds the configured ${maxBytes}-byte limit`);
     }
     return text;
+}
+function resourceSegment(value) {
+    let decoded;
+    try {
+        if (typeof value !== "string") {
+            throw new Error();
+        }
+        decoded = decodeURIComponent(value);
+    }
+    catch {
+        throw new McpError(ErrorCode.InvalidParams, "Invalid encoded resource URI segment");
+    }
+    if (!decoded ||
+        decoded === "." ||
+        decoded === ".." ||
+        /[/\\?#\u0000-\u001f\u007f]/u.test(decoded)) {
+        throw new McpError(ErrorCode.InvalidParams, "Invalid resource URI segment");
+    }
+    return decoded;
 }
 function encodeListCursor(kind, context, after) {
     return Buffer.from(JSON.stringify({ kind, context, after }), "utf8").toString("base64url");
@@ -82,7 +128,7 @@ export function createArangoMcpServer(config, version) {
     }))
         .digest("base64url")
         .slice(0, 16);
-    const server = new McpServer({
+    const server = new BoundedErrorMcpServer(config, {
         name: "arangodb-mcp-server",
         title: "ArangoDB MCP Server",
         version,
@@ -458,8 +504,8 @@ export function createArangoMcpServer(config, version) {
         description: "Collection properties, document count, schema, and indexes",
         annotations: { audience: ["assistant"], priority: 0.7 },
     }, async (uri, variables) => {
-        const databaseName = String(variables.database);
-        const collectionName = String(variables.collection);
+        const databaseName = resourceSegment(variables.database);
+        const collectionName = resourceSegment(variables.collection);
         const details = await safelyReadResource("collectionResource", () => service.describeCollection(databaseName, collectionName));
         return {
             contents: [
@@ -483,7 +529,10 @@ export function createArangoMcpServer(config, version) {
         description: "A single explicitly addressed ArangoDB document",
         annotations: { audience: ["assistant"], priority: 0.5 },
     }, async (uri, variables) => {
-        const document = await safelyReadResource("documentResource", () => service.readDocument(String(variables.database), String(variables.collection), String(variables.documentId)));
+        const databaseName = resourceSegment(variables.database);
+        const collectionName = resourceSegment(variables.collection);
+        const documentId = resourceSegment(variables.documentId);
+        const document = await safelyReadResource("documentResource", () => service.readDocument(databaseName, collectionName, documentId));
         return {
             contents: [
                 {
@@ -518,12 +567,24 @@ export function createArangoMcpServer(config, version) {
             },
         ],
     }));
-    return {
-        server,
-        service,
-        async close() {
-            await server.close();
-            await service.close();
-        },
+    let closePromise;
+    function close() {
+        // Defer execution until the promise is assigned: server.close() invokes
+        // onclose synchronously, which must reuse this promise instead of recursing.
+        closePromise ??= Promise.resolve().then(async () => {
+            try {
+                await server.close();
+            }
+            finally {
+                await service.close();
+            }
+        });
+        return closePromise;
+    }
+    server.server.onclose = () => {
+        void close().catch((error) => {
+            server.server.onerror?.(error instanceof Error ? error : new Error(String(error)));
+        });
     };
+    return { server, service, close };
 }

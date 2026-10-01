@@ -513,6 +513,52 @@ test(
 );
 
 test(
+  "rejects document selectors that escape the collection allowlist",
+  { skip: !url, timeout: 60_000 },
+  async () => {
+    const admin = new Database({ url, databaseName: "_system", auth: { username, password } });
+    const allowedName = `mcp_selector_allowed_${Date.now()}`;
+    const forbiddenName = `${allowedName}_forbidden`;
+    const allowed = admin.collection(allowedName);
+    const forbidden = admin.collection(forbiddenName);
+    const { client, transport } = createClient(allowedName, { documentWrites: true });
+    try {
+      await Promise.all([allowed.create(), forbidden.create()]);
+      await forbidden.save({ _key: "protected", value: "unchanged" });
+      const original = await forbidden.document("protected");
+      await client.connect(transport);
+
+      for (const documentId of [
+        `${allowedName}/../${forbiddenName}/protected`,
+        `${allowedName}/../../document/${forbiddenName}/protected`,
+        `${forbiddenName}/protected`,
+      ]) {
+        for (const name of ["updateDocument", "deleteDocument"]) {
+          const result = await client.callTool({
+            name,
+            arguments: {
+              databaseName: "_system",
+              collectionName: allowedName,
+              documentId,
+              revision: original._rev,
+              ...(name === "updateDocument" ? { patch: { value: "modified" } } : {}),
+            },
+          });
+          assert.equal(result.isError, true, `${name} must reject ${documentId}`);
+          assert.deepEqual(await forbidden.document("protected"), original);
+        }
+      }
+    } finally {
+      await client.close();
+      await Promise.all([allowed.drop(), forbidden.drop()].map((operation) =>
+        operation.catch(() => undefined)
+      ));
+      admin.close();
+    }
+  },
+);
+
+test(
   "preserves the database-side read-only boundary with a dedicated user",
   { skip: !url, timeout: 60_000 },
   async () => {

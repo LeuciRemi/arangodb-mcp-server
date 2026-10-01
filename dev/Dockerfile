@@ -14,4 +14,4 @@ COPY ./init.js /docker-entrypoint-initdb.d/
 EXPOSE 8529
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-  CMD-SHELL curl -fsS -u "root:${ARANGO_ROOT_PASSWORD}" http://localhost:8529/_api/version || exit 1
+  CMD curl -fsS -u "root:${ARANGO_ROOT_PASSWORD}" http://localhost:8529/_api/version || exit 1

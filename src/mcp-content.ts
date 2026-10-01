@@ -1,5 +1,33 @@
 import type { QueryPage } from "./arangodb-service.js";
 
+/** Bound the serialized error result, including JSON escaping and its envelope. */
+export function boundedToolErrorResult(message: string, maxBytes: number) {
+  const resultFor = (text: string) => ({
+    content: [{ type: "text" as const, text }],
+    isError: true as const,
+  });
+  const fits = (text: string) =>
+    Buffer.byteLength(JSON.stringify(resultFor(text)), "utf8") <= maxBytes;
+  if (fits(message)) {
+    return resultFor(message);
+  }
+
+  const suffix = "… [truncated]";
+  let low = 0;
+  let high = message.length;
+  const prefix = (length: number) =>
+    message.slice(0, length).replace(/[\uD800-\uDBFF]$/u, "");
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (fits(prefix(middle) + suffix)) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return resultFor(prefix(low) + suffix);
+}
+
 export interface ToolContentResult {
   [key: string]: unknown;
   content: Array<{ type: "text"; text: string }>;

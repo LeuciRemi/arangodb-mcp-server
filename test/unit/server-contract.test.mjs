@@ -4,12 +4,16 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
+const testEnvironment = Object.fromEntries(
+  Object.entries(process.env).filter(([name]) => !name.startsWith("ARANGO_")),
+);
+
 test("advertises the minimal structured tool profile by default", async () => {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: ["dist/index.js"],
     env: {
-      ...process.env,
+      ...testEnvironment,
       ARANGO_URL: "http://127.0.0.1:1",
       ARANGO_ENABLE_DOCUMENT_WRITES: "false",
       ARANGO_ENABLE_READ_WRITE_QUERY: "false",
@@ -69,7 +73,7 @@ test("separates document CRUD from arbitrary write-capable AQL", async () => {
       command: process.execPath,
       args: ["dist/index.js"],
       env: {
-        ...process.env,
+        ...testEnvironment,
         ARANGO_URL: "http://127.0.0.1:1",
         ARANGO_ENABLE_DIAGNOSTIC_TOOLS: "false",
         ...env,
@@ -117,7 +121,7 @@ test("adds diagnostic tools only when explicitly enabled", async () => {
     command: process.execPath,
     args: ["dist/index.js"],
     env: {
-      ...process.env,
+      ...testEnvironment,
       ARANGO_URL: "http://127.0.0.1:1",
       ARANGO_ENABLE_DOCUMENT_WRITES: "false",
       ARANGO_ENABLE_READ_WRITE_QUERY: "false",

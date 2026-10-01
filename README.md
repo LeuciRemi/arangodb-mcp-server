@@ -35,6 +35,10 @@ Use a dedicated ArangoDB user with **Read Only** collection permissions for the 
 
 All tools provide MCP `outputSchema`, `structuredContent`, text fallback content, and risk annotations.
 
+Document tools accept a document key or a `collection/key` identifier whose collection
+matches `collectionName`. Path separators inside keys, traversal segments, and URL
+query or fragment syntax are rejected before a request reaches ArangoDB.
+
 The default minimal profile exposes six tools: `listDatabases`, `listCollections`,
 `describeCollection`, `sampleDocuments`, `readQuery`, and `continueQuery`.
 Set `ARANGO_ENABLE_DIAGNOSTIC_TOOLS=true` (or pass
@@ -138,6 +142,11 @@ Use bind variables for values and collection names:
 When more rows are available, the result includes `hasMore: true` and an opaque `nextCursor`. Pass it to `continueQuery` before its TTL expires. Cursors are process-local and must not be persisted across server restarts.
 
 Write-query results are fully consumed into a private temporary spool before the transaction commits, so writes never depend on a client consuming every continuation page. If the spool would exceed `ARANGO_MCP_MAX_WRITE_SPOOL_BYTES`, the cursor is closed and the transaction is rolled back before any write becomes visible. Return fewer or smaller values from write AQL, or raise the limit deliberately when larger result sets are expected.
+
+Cancellation observed before commit rolls back a write query. Once commit has begun,
+cancellation cannot guarantee rollback; a committed operation must not be retried on
+the assumption that cancellation undid it. Closing the MCP client cleans up remaining
+query sessions and temporary result files.
 
 `listDatabases` and `listCollections` also accept `limit` and an opaque `cursor`, and return `nextCursor` when another metadata page is available. Metadata cursors are bound to their list type, database context, and current access policy.
 

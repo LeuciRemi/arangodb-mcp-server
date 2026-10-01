@@ -22,8 +22,11 @@ export class ArangoDBService {
     databaseConnections = new Map();
     cursorSessions = new Map();
     cleanupTimer;
-    cleaningExpiredCursors = false;
+    cursorCleanup;
     cursorReservations = 0;
+    cursorReservationsDrained;
+    closed = false;
+    closePromise;
     constructor(config) {
         this.config = config;
         const auth = config.username !== undefined
@@ -35,6 +38,7 @@ export class ArangoDBService {
             ...(auth ? { auth } : {}),
             ...(agentOptions ? { agentOptions } : {}),
             poolSize: 3,
+            timeout: config.requestTimeoutMs,
         });
         this.cleanupTimer = setInterval(() => {
             void this.cleanupExpiredCursors();
@@ -59,6 +63,32 @@ export class ArangoDBService {
             throw new UserFacingError(`Database "${databaseName}" is not allowed by server policy`);
         }
     }
+    assertOpen() {
+        if (this.closed) {
+            throw new UserFacingError("The server is shutting down");
+        }
+    }
+    assertQueryActive(signal) {
+        this.assertOpen();
+        if (signal?.aborted) {
+            throw new UserFacingError("Query was cancelled by the client");
+        }
+    }
+    documentKey(collectionName, documentId) {
+        const parts = documentId.split("/");
+        if (parts.length > 2 || (parts.length === 2 && parts[0] !== collectionName)) {
+            throw new UserFacingError("Document ID must be a key or a collection/key identifier matching collectionName");
+        }
+        const key = parts[parts.length - 1];
+        if (key.length === 0 ||
+            key.length > 254 ||
+            key === "." ||
+            key === ".." ||
+            !/^[A-Za-z0-9_:.@()+,=;$!*'%-]+$/.test(key)) {
+            throw new UserFacingError("Document ID contains an invalid or unsafe document key");
+        }
+        return key;
+    }
     assertCollectionAllowed(databaseName, collectionName) {
         this.assertDatabaseAllowed(databaseName);
         if (this.config.allowedCollections.size > 0 &&
@@ -81,6 +111,7 @@ export class ArangoDBService {
             .map((entry) => entry.slice(prefix.length));
     }
     getDatabase(databaseName) {
+        this.assertOpen();
         this.assertDatabaseAllowed(databaseName);
         const existing = this.databaseConnections.get(databaseName);
         if (existing) {
@@ -96,11 +127,13 @@ export class ArangoDBService {
             ...(auth ? { auth } : {}),
             ...(agentOptions ? { agentOptions } : {}),
             poolSize: 3,
+            timeout: this.config.requestTimeoutMs,
         });
         this.databaseConnections.set(databaseName, database);
         return database;
     }
     async listDatabases() {
+        this.assertOpen();
         const databases = await this.rootDatabase.databases();
         return databases
             .map((database) => database.name)
@@ -140,9 +173,10 @@ export class ArangoDBService {
     }
     async readDocument(databaseName, collectionName, documentId) {
         this.assertCollectionAllowed(databaseName, collectionName);
+        const key = this.documentKey(collectionName, documentId);
         const document = await this.getDatabase(databaseName)
             .collection(collectionName)
-            .document(documentId);
+            .document(key);
         const bytes = Buffer.byteLength(JSON.stringify(document), "utf8");
         if (bytes > this.config.maxBytes) {
             throw new UserFacingError(`Document is ${bytes} bytes and exceeds the ${this.config.maxBytes}-byte response limit`);
@@ -180,21 +214,23 @@ export class ArangoDBService {
     async updateDocument(databaseName, collectionName, documentId, revision, patch) {
         this.assertDocumentWritesEnabled();
         this.assertCollectionAllowed(databaseName, collectionName);
+        const key = this.documentKey(collectionName, documentId);
         this.assertDocumentPayload(patch);
         if (["_id", "_key", "_rev"].some((field) => field in patch)) {
             throw new UserFacingError("Update patch must not modify _id, _key, or _rev");
         }
         const result = await this.getDatabase(databaseName)
             .collection(collectionName)
-            .update(documentId, patch, { ifMatch: revision, returnNew: true });
+            .update(key, patch, { ifMatch: revision, returnNew: true });
         return operationMetadata(result);
     }
     async deleteDocument(databaseName, collectionName, documentId, revision) {
         this.assertDocumentWritesEnabled();
         this.assertCollectionAllowed(databaseName, collectionName);
+        const key = this.documentKey(collectionName, documentId);
         const result = await this.getDatabase(databaseName)
             .collection(collectionName)
-            .remove(documentId, { ifMatch: revision, returnOld: true });
+            .remove(key, { ifMatch: revision, returnOld: true });
         return operationMetadata(result);
     }
     validateQueryInput(query, bindVars) {
@@ -245,18 +281,30 @@ export class ArangoDBService {
         }
     }
     async reserveCursorCapacity() {
+        this.assertOpen();
         await this.cleanupExpiredCursors();
+        this.assertOpen();
         if (this.cursorSessions.size + this.cursorReservations >=
             this.config.maxActiveCursors) {
             throw new UserFacingError(`The server already has ${this.config.maxActiveCursors} active cursors; consume or let one expire before starting another query`);
         }
         this.cursorReservations += 1;
     }
+    releaseCursorCapacity() {
+        this.cursorReservations -= 1;
+        if (this.cursorReservations === 0) {
+            this.cursorReservationsDrained?.();
+            this.cursorReservationsDrained = undefined;
+        }
+    }
     async executeReadQuery(databaseName, query, bindVars, pageSize, signal) {
         this.assertPageSize(pageSize);
+        this.assertQueryActive(signal);
         await this.reserveCursorCapacity();
         try {
+            this.assertQueryActive(signal);
             const plan = await this.getReadOnlyPlan(databaseName, query, bindVars);
+            this.assertQueryActive(signal);
             const database = this.getDatabase(databaseName);
             const readCollections = this.declaredReadCollections(databaseName, plan.collections.map((collection) => collection.name));
             const transactionOptions = {
@@ -267,6 +315,7 @@ export class ArangoDBService {
             };
             const transaction = await database.beginTransaction({ read: readCollections }, transactionOptions);
             try {
+                this.assertQueryActive(signal);
                 const cursor = (await transaction.step(() => database.query(query, bindVars, {
                     batchSize: pageSize,
                     count: false,
@@ -294,19 +343,22 @@ export class ArangoDBService {
             }
         }
         finally {
-            this.cursorReservations -= 1;
+            this.releaseCursorCapacity();
         }
     }
     async executeWriteQuery(databaseName, query, bindVars, pageSize, signal) {
         this.assertReadWriteQueryEnabled();
         this.assertPageSize(pageSize);
+        this.assertQueryActive(signal);
         await this.reserveCursorCapacity();
         try {
+            this.assertQueryActive(signal);
             this.validateQueryInput(query, bindVars);
             const database = this.getDatabase(databaseName);
             const explanation = await database.explain(query, bindVars, {
                 maxNumberOfPlans: 1,
             });
+            this.assertQueryActive(signal);
             const plannedCollections = explanation.plan.collections;
             this.assertCollectionsAllowed(databaseName, unique(plannedCollections.map((collection) => collection.name)));
             const writeCollections = unique(plannedCollections
@@ -322,7 +374,9 @@ export class ArangoDBService {
             };
             const transaction = await database.beginTransaction({ read: readCollections, write: writeCollections }, transactionOptions);
             let spool;
+            let committed = false;
             try {
+                this.assertQueryActive(signal);
                 const cursor = (await transaction.step(() => database.query(query, bindVars, {
                     batchSize: pageSize,
                     count: false,
@@ -333,8 +387,10 @@ export class ArangoDBService {
                     timeout: this.config.requestTimeoutMs,
                     maxWarningCount: 10,
                 })));
-                spool = await this.spoolWriteResults(transaction, cursor);
+                spool = await this.spoolWriteResults(transaction, cursor, signal);
+                this.assertQueryActive(signal);
                 await transaction.commit();
+                committed = true;
                 const session = {
                     token: randomUUID(),
                     databaseName,
@@ -344,33 +400,46 @@ export class ArangoDBService {
                     isWrite: true,
                     spool,
                 };
-                return await this.consumeOrStoreSession(session, pageSize, signal);
+                // Once committed, cancellation cannot roll back the write. Return its
+                // result instead of reporting that the write was cancelled.
+                return await this.consumeOrStoreSession(session, pageSize);
             }
             catch (error) {
                 if (spool) {
                     await this.removeSpool(spool);
                 }
-                await transaction.abort().catch(() => undefined);
+                if (!committed) {
+                    await transaction.abort().catch(() => undefined);
+                }
                 throw error;
             }
         }
         finally {
-            this.cursorReservations -= 1;
+            this.releaseCursorCapacity();
         }
     }
     async continueQuery(token, pageSize, signal) {
+        this.assertOpen();
         this.assertPageSize(pageSize);
         const session = this.cursorSessions.get(token);
         if (!session) {
             throw new UserFacingError("Query cursor was not found or has expired");
         }
+        // Moving a session out of the map must retain its capacity while a page is
+        // being fetched; otherwise concurrent queries can claim the same slot.
+        this.cursorReservations += 1;
         this.cursorSessions.delete(token);
-        if (session.expiresAt <= Date.now()) {
-            await this.finishSession(session, false);
-            throw new UserFacingError("Query cursor has expired");
+        try {
+            if (session.expiresAt <= Date.now()) {
+                await this.finishSession(session, false);
+                throw new UserFacingError("Query cursor has expired");
+            }
+            session.expiresAt = Date.now() + this.config.cursorTtlSeconds * 1_000;
+            return await this.consumeOrStoreSession(session, pageSize, signal);
         }
-        session.expiresAt = Date.now() + this.config.cursorTtlSeconds * 1_000;
-        return this.consumeOrStoreSession(session, pageSize, signal);
+        finally {
+            this.releaseCursorCapacity();
+        }
     }
     async consumeOrStoreSession(session, pageSize, signal) {
         try {
@@ -393,8 +462,8 @@ export class ArangoDBService {
         const rows = [];
         let bytes = 2;
         while (rows.length < pageSize) {
-            if (signal?.aborted) {
-                throw new UserFacingError("Query was cancelled by the client");
+            if (!session.isWrite) {
+                this.assertQueryActive(signal);
             }
             let item;
             if (session.pending.length > 0) {
@@ -408,12 +477,19 @@ export class ArangoDBService {
                     ? await session.transaction.step(() => session.cursor.next())
                     : await session.cursor.next();
             }
+            if (!session.isWrite) {
+                this.assertQueryActive(signal);
+            }
             if (item === undefined) {
                 break;
             }
             const serialized = JSON.stringify(item);
             const itemBytes = Buffer.byteLength(serialized, "utf8") + (rows.length ? 1 : 0);
             if (bytes + itemBytes > this.config.maxBytes) {
+                if (rows.length > 0) {
+                    session.pending.unshift(item);
+                    break;
+                }
                 if (session.isWrite) {
                     const marker = {
                         _mcpResultOmitted: true,
@@ -430,11 +506,7 @@ export class ArangoDBService {
                     bytes += markerBytes;
                     continue;
                 }
-                if (rows.length === 0) {
-                    throw new UserFacingError(`A single result row exceeds the ${this.config.maxBytes}-byte response limit; project fewer fields in the AQL query`);
-                }
-                session.pending.unshift(item);
-                break;
+                throw new UserFacingError(`A single result row exceeds the ${this.config.maxBytes}-byte response limit; project fewer fields in the AQL query`);
             }
             rows.push(item);
             bytes += itemBytes;
@@ -514,13 +586,15 @@ export class ArangoDBService {
         return session.pending.length > 0 ||
             (session.spool ? session.spool.offset < session.spool.size : session.cursor.hasNext);
     }
-    async spoolWriteResults(transaction, cursor) {
+    async spoolWriteResults(transaction, cursor, signal) {
         const path = join(tmpdir(), `arangodb-mcp-write-${randomUUID()}`);
         const file = await open(path, "wx+", 0o600);
         const spool = { file, path, offset: 0, size: 0 };
         try {
             while (cursor.hasNext) {
+                this.assertQueryActive(signal);
                 const item = await transaction.step(() => cursor.next());
+                this.assertQueryActive(signal);
                 if (item === undefined) {
                     break;
                 }
@@ -573,19 +647,20 @@ export class ArangoDBService {
         await spool.file.close().catch(() => undefined);
         await unlink(spool.path).catch(() => undefined);
     }
-    async cleanupExpiredCursors() {
-        if (this.cleaningExpiredCursors) {
-            return;
+    cleanupExpiredCursors() {
+        if (!this.cursorCleanup) {
+            this.cursorCleanup = (async () => {
+                try {
+                    const now = Date.now();
+                    const expired = [...this.cursorSessions.values()].filter((session) => session.expiresAt <= now);
+                    await Promise.all(expired.map((session) => this.finishSession(session, false)));
+                }
+                finally {
+                    this.cursorCleanup = undefined;
+                }
+            })();
         }
-        this.cleaningExpiredCursors = true;
-        try {
-            const now = Date.now();
-            const expired = [...this.cursorSessions.values()].filter((session) => session.expiresAt <= now);
-            await Promise.all(expired.map((session) => this.finishSession(session, false)));
-        }
-        finally {
-            this.cleaningExpiredCursors = false;
-        }
+        return this.cursorCleanup;
     }
     async sampleDocuments(databaseName, collectionName, limit, fields, signal) {
         this.assertCollectionAllowed(databaseName, collectionName);
@@ -598,6 +673,7 @@ export class ArangoDBService {
        RETURN LENGTH(@fields) == 0 ? doc : KEEP(doc, @fields)`, { "@collection": collectionName, limit, fields }, limit, signal);
     }
     async health() {
+        this.assertOpen();
         const [version, availability] = await Promise.all([
             this.rootDatabase.version(true),
             this.rootDatabase.availability(true),
@@ -627,8 +703,21 @@ export class ArangoDBService {
                 : "all collections visible to the ArangoDB user",
         };
     }
-    async close() {
-        clearInterval(this.cleanupTimer);
+    close() {
+        if (!this.closePromise) {
+            this.closed = true;
+            clearInterval(this.cleanupTimer);
+            this.closePromise = this.closeConnections();
+        }
+        return this.closePromise;
+    }
+    async closeConnections() {
+        if (this.cursorReservations > 0) {
+            await new Promise((resolve) => {
+                this.cursorReservationsDrained = resolve;
+            });
+        }
+        await this.cursorCleanup;
         await Promise.all([...this.cursorSessions.values()].map((session) => this.finishSession(session, false)));
         for (const database of this.databaseConnections.values()) {
             database.close();

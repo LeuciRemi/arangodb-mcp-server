@@ -38,5 +38,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run generate-data
+      - run: npm run docker:build
       - run: npm run test:integration:docker
       - run: npm run test:package

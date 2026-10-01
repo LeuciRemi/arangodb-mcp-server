@@ -53,11 +53,12 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "arangojs": "^10.3.1",
+    "undici": "^6.29.0",
     "zod": "^4.4.3"
   },
   "overrides": {
     "@hono/node-server": "2.0.12",
-    "fast-uri": "3.1.5"
+    "fast-uri": "3.1.8"
   },
   "devDependencies": {
     "nodemon": "^3.1.14",

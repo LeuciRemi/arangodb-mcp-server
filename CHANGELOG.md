@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- Validate document selectors before HTTP requests to prevent collection-policy bypasses through path traversal.
+- Honor cancellation before write-query commit, preserve write results across page boundaries, and count in-flight continuations toward cursor capacity.
+- Apply request timeouts to all ArangoDB connections and include the runtime dependency required for HTTPS.
+- Decode resource URI variables safely, bound MCP error responses, and clean up sessions when the client closes stdin.
+- Correct the development Dockerfile health check and expand regression, TLS, package, and CI validation.
+- Refresh production dependencies with published security fixes.
+
 ## 2.0.0
 
 - **Breaking:** return structured, paginated envelopes; clients should prefer `structuredContent`, while the text content retains a compact JSON fallback for compatibility with clients that do not expose structured results.

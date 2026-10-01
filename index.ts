@@ -35,22 +35,21 @@ async function main(): Promise<void> {
 
   const application = createArangoMcpServer(config, packageJson.version);
   const transport = new StdioServerTransport();
-  let shuttingDown = false;
+  let shutdownPromise: Promise<void> | undefined;
 
-  const shutdown = async (): Promise<void> => {
-    if (shuttingDown) {
-      return;
-    }
-    shuttingDown = true;
-    await application.close().catch((error: unknown) => {
+  const shutdown = (): Promise<void> => {
+    shutdownPromise ??= application.close().catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`Shutdown error: ${message}`);
       process.exitCode = 1;
     });
+    return shutdownPromise;
   };
 
   process.once("SIGINT", () => void shutdown());
   process.once("SIGTERM", () => void shutdown());
+  process.stdin.once("end", () => void shutdown());
+  process.stdin.once("close", () => void shutdown());
 
   await application.server.connect(transport);
 }
