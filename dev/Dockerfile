@@ -1,4 +1,4 @@
-FROM arangodb:3.12
+FROM arangodb:3.12.12
 
 # Collections that will be loaded in the databases.
 # See the readme for generation instructions.

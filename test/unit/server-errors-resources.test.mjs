@@ -50,7 +50,9 @@ test("bounds SDK input validation and unknown-tool errors before callbacks run",
   };
   const invalidInput = await client.callTool({
     name: "sampleDocuments",
-    arguments: { databaseName: "db", collectionName: "col", fields: Array(300).fill(42) },
+    // Stay within the array-size limit so per-item validation produces an
+    // oversized error even when the validator short-circuits oversized arrays.
+    arguments: { databaseName: "db", collectionName: "col", fields: Array(100).fill(42) },
   });
   assertBoundedError(invalidInput);
   assert.match(invalidInput.content[0].text, /truncated/);

@@ -10,6 +10,10 @@ All notable changes to this project are documented here.
 - Decode resource URI variables safely, bound MCP error responses, and clean up sessions when the client closes stdin.
 - Correct the development Dockerfile health check and expand regression, TLS, package, and CI validation.
 - Refresh production dependencies with published security fixes.
+- Update MCP SDK to 1.32.1, arangojs to 10.6.0, Undici to 6.29.1 and Zod to 4.6.7; refresh compatible transitives, including proxy-addr 2.0.8.
+- Pin the disposable development/integration database to ArangoDB 3.12.12 and run CI for develop pushes.
+- Keep the oversized SDK validation-error regression effective when array-length checks short-circuit per-item validation; preserve the byte limit, truncation and no-callback assertions.
+- Production-only npm audit is clean for this update. The development-only braces advisory remains through nodemon/shx; no forced downgrade or audit suppression is applied.
 
 ## 2.0.0
 

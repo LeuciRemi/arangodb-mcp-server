@@ -30,7 +30,7 @@ try {
       `127.0.0.1:${port}:8529`,
       "--env",
       "ARANGO_ROOT_PASSWORD=test",
-      "arangodb:3.12",
+      "arangodb:3.12.12",
     ],
     { stdio: "inherit" },
   );
