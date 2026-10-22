@@ -1,8 +1,12 @@
 import { createHash } from "node:crypto";
 
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import {
+  McpServer,
+  ProtocolError,
+  ProtocolErrorCode,
+  ResourceTemplate,
+  type Transport,
+} from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 import { ArangoDBService, type QueryPage } from "./arangodb-service.js";
@@ -10,6 +14,7 @@ import type { ServerConfig } from "./config.js";
 import { publicErrorMessage, redactErrorMessage } from "./errors.js";
 import {
   boundedObjectResult,
+  boundedProtocolError,
   boundedQueryPageResult,
   boundedToolErrorResult,
 } from "./mcp-content.js";
@@ -27,7 +32,20 @@ class BoundedErrorMcpServer extends McpServer {
     // same limit at the owned transport boundary so these errors are covered too.
     const send = transport.send.bind(transport);
     transport.send = (message, options) => {
-      if ("result" in message && message.result.isError === true) {
+      if ("error" in message && message.error) {
+        // SDK v2 reports unknown tools and other protocol failures as JSON-RPC
+        // errors rather than tool results; bound and redact them the same way.
+        message = {
+          ...message,
+          error: boundedProtocolError(
+            {
+              ...message.error,
+              message: redactErrorMessage(message.error.message, this.config),
+            },
+            this.config.maxBytes,
+          ),
+        };
+      } else if ("result" in message && message.result.isError === true) {
         const content = Array.isArray(message.result.content) ? message.result.content : [];
         const text = content
           .filter((item) => item && item.type === "text" && typeof item.text === "string")
@@ -52,7 +70,7 @@ const warningSchema = z.object({
   message: z.string(),
 });
 
-const queryOutputSchema = {
+const queryOutputSchema = z.object({
   rows: z.array(z.unknown()),
   rowCount: z.number().int().nonnegative(),
   bytes: z.number().int().nonnegative(),
@@ -60,7 +78,7 @@ const queryOutputSchema = {
   nextCursor: z.string().optional(),
   warnings: z.array(warningSchema),
   stats: z.record(z.string(), z.unknown()).optional(),
-};
+});
 
 const readOnlyAnnotations = {
   readOnlyHint: true,
@@ -86,8 +104,8 @@ function resourceText(value: unknown, uri: string, maxBytes: number): string {
     "utf8",
   );
   if (bytes > maxBytes) {
-    throw new McpError(
-      ErrorCode.InternalError,
+    throw new ProtocolError(
+      ProtocolErrorCode.InternalError,
       `Complete MCP resource response is ${bytes} bytes and exceeds the configured ${maxBytes}-byte limit`,
     );
   }
@@ -102,7 +120,7 @@ function resourceSegment(value: string | string[] | undefined): string {
     }
     decoded = decodeURIComponent(value);
   } catch {
-    throw new McpError(ErrorCode.InvalidParams, "Invalid encoded resource URI segment");
+    throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Invalid encoded resource URI segment");
   }
   if (
     !decoded ||
@@ -110,7 +128,7 @@ function resourceSegment(value: string | string[] | undefined): string {
     decoded === ".." ||
     /[/\\?#\u0000-\u001f\u007f]/u.test(decoded)
   ) {
-    throw new McpError(ErrorCode.InvalidParams, "Invalid resource URI segment");
+    throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Invalid resource URI segment");
   }
   return decoded;
 }
@@ -244,11 +262,11 @@ export function createArangoMcpServer(
     } catch (error) {
       const message = publicErrorMessage(error, config);
       log("error", { operation, status: "failed" });
-      throw new McpError(ErrorCode.InternalError, message);
+      throw new ProtocolError(ProtocolErrorCode.InternalError, message);
     }
   }
 
-  const queryInputSchema = {
+  const queryInputSchema = z.object({
     databaseName: z.string().min(1).describe("Database to query"),
     aql: z.string().min(1).max(100_000).describe("AQL query to execute"),
     bindVars: z
@@ -264,7 +282,7 @@ export function createArangoMcpServer(
       .optional()
       .default(Math.min(50, config.maxRows))
       .describe(`Rows to return, capped at ${config.maxRows}`),
-  };
+  });
 
   server.registerTool(
     "readQuery",
@@ -276,7 +294,7 @@ export function createArangoMcpServer(
       outputSchema: queryOutputSchema,
       annotations: readOnlyAnnotations,
     },
-    async ({ databaseName, aql, bindVars, pageSize }, extra) => {
+    async ({ databaseName, aql, bindVars, pageSize }, ctx) => {
       log("debug", {
         operation: "readQuery",
         databaseName,
@@ -284,7 +302,7 @@ export function createArangoMcpServer(
         bindVariableCount: Object.keys(bindVars).length,
       });
       const page = await safely("readQuery", () =>
-        service.executeReadQuery(databaseName, aql, bindVars, pageSize, extra.signal),
+        service.executeReadQuery(databaseName, aql, bindVars, pageSize, ctx.mcpReq.signal),
       );
       return queryPageContent(page, config.maxBytes);
     },
@@ -296,7 +314,7 @@ export function createArangoMcpServer(
       title: "Continue a query",
       description:
         "Read the next bounded page from a stateful cursor returned by a query tool. When write-capable AQL is enabled, this also accepts readWriteQuery cursors.",
-      inputSchema: {
+      inputSchema: z.object({
         cursor: z.string().uuid().describe("Opaque nextCursor from a previous query result"),
         pageSize: z
           .number()
@@ -305,13 +323,13 @@ export function createArangoMcpServer(
           .max(config.maxRows)
           .optional()
           .default(Math.min(50, config.maxRows)),
-      },
+      }),
       outputSchema: queryOutputSchema,
       annotations: continuationAnnotations,
     },
-    async ({ cursor, pageSize }, extra) => {
+    async ({ cursor, pageSize }, ctx) => {
       const page = await safely("continueQuery", () =>
-        service.continueQuery(cursor, pageSize, extra.signal),
+        service.continueQuery(cursor, pageSize, ctx.mcpReq.signal),
       );
       return queryPageContent(page, config.maxBytes);
     },
@@ -324,12 +342,12 @@ export function createArangoMcpServer(
         title: "Explain read-only AQL",
         description:
           "Validate that an AQL query is read-only and return a compact optimizer plan without executing it.",
-        inputSchema: {
-          databaseName: queryInputSchema.databaseName,
-          aql: queryInputSchema.aql,
-          bindVars: queryInputSchema.bindVars,
-        },
-        outputSchema: {
+        inputSchema: z.object({
+          databaseName: queryInputSchema.shape.databaseName,
+          aql: queryInputSchema.shape.aql,
+          bindVars: queryInputSchema.shape.bindVars,
+        }),
+        outputSchema: z.object({
           databaseName: z.string(),
           isModificationQuery: z.boolean(),
           estimatedCost: z.number(),
@@ -346,7 +364,7 @@ export function createArangoMcpServer(
             }),
           ),
           warnings: z.array(warningSchema),
-        },
+        }),
         annotations: readOnlyAnnotations,
       },
       async ({ databaseName, aql, bindVars }) => {
@@ -363,7 +381,7 @@ export function createArangoMcpServer(
     {
       title: "List databases",
       description: "List databases visible to both the ArangoDB user and server policy.",
-      inputSchema: {
+      inputSchema: z.object({
         cursor: z.string().max(2_048).optional().describe("Opaque cursor from a previous page"),
         limit: z
           .number()
@@ -372,13 +390,13 @@ export function createArangoMcpServer(
           .max(config.maxRows)
           .optional()
           .default(Math.min(50, config.maxRows)),
-      },
-      outputSchema: {
+      }),
+      outputSchema: z.object({
         databases: z.array(z.object({ name: z.string() })),
         totalDatabases: z.number().int().nonnegative(),
         truncated: z.boolean(),
         nextCursor: z.string().optional(),
-      },
+      }),
       annotations: readOnlyAnnotations,
     },
     async ({ cursor, limit }) => {
@@ -408,7 +426,7 @@ export function createArangoMcpServer(
     {
       title: "List collections",
       description: "List non-system collections in an allowed database.",
-      inputSchema: {
+      inputSchema: z.object({
         databaseName: z.string().min(1).describe("Database to inspect"),
         cursor: z.string().max(2_048).optional().describe("Opaque cursor from a previous page"),
         limit: z
@@ -418,8 +436,8 @@ export function createArangoMcpServer(
           .max(config.maxRows)
           .optional()
           .default(Math.min(50, config.maxRows)),
-      },
-      outputSchema: {
+      }),
+      outputSchema: z.object({
         databaseName: z.string(),
         collections: z.array(
           z.object({
@@ -432,7 +450,7 @@ export function createArangoMcpServer(
         totalCollections: z.number().int().nonnegative(),
         truncated: z.boolean(),
         nextCursor: z.string().optional(),
-      },
+      }),
       annotations: readOnlyAnnotations,
     },
     async ({ databaseName, cursor, limit }) => {
@@ -466,13 +484,13 @@ export function createArangoMcpServer(
       title: "Describe a collection",
       description:
         "Return collection properties, document count, optional JSON Schema, and indexes without sampling documents.",
-      inputSchema: {
+      inputSchema: z.object({
         databaseName: z.string().min(1),
         collectionName: z.string().min(1),
-      },
-      outputSchema: {
+      }),
+      outputSchema: z.object({
         details: z.record(z.string(), z.unknown()),
-      },
+      }),
       annotations: readOnlyAnnotations,
     },
     async ({ databaseName, collectionName }) => {
@@ -489,7 +507,7 @@ export function createArangoMcpServer(
       title: "Sample documents",
       description:
         "Explicitly sample up to 20 documents, optionally projecting selected fields. Use only when document contents are needed.",
-      inputSchema: {
+      inputSchema: z.object({
         databaseName: z.string().min(1),
         collectionName: z.string().min(1),
         limit: z
@@ -500,18 +518,18 @@ export function createArangoMcpServer(
           .optional()
           .default(Math.min(5, config.maxRows)),
         fields: z.array(z.string().min(1)).max(100).optional().default([]),
-      },
+      }),
       outputSchema: queryOutputSchema,
       annotations: readOnlyAnnotations,
     },
-    async ({ databaseName, collectionName, limit, fields }, extra) => {
+    async ({ databaseName, collectionName, limit, fields }, ctx) => {
       const page = await safely("sampleDocuments", () =>
         service.sampleDocuments(
           databaseName,
           collectionName,
           limit,
           fields,
-          extra.signal,
+          ctx.mcpReq.signal,
         ),
       );
       return queryPageContent(page, config.maxBytes);
@@ -525,9 +543,9 @@ export function createArangoMcpServer(
         title: "Check ArangoDB health",
         description:
           "Check connectivity and report ArangoDB version, availability, active cursor count, policies, and safety limits.",
-        outputSchema: {
+        outputSchema: z.object({
           health: z.record(z.string(), z.unknown()),
-        },
+        }),
         annotations: readOnlyAnnotations,
       },
       async () => {
@@ -542,9 +560,9 @@ export function createArangoMcpServer(
       databaseName: z.string().min(1),
       collectionName: z.string().min(1),
     };
-    const documentOutput = {
+    const documentOutput = z.object({
       metadata: z.record(z.string(), z.unknown()),
-    };
+    });
 
     server.registerTool(
       "insertDocument",
@@ -552,10 +570,10 @@ export function createArangoMcpServer(
         title: "Insert a document",
         description:
           "Insert one bounded document into an allowed collection and return its operation metadata.",
-        inputSchema: {
+        inputSchema: z.object({
           ...documentWriteInput,
           document: z.record(z.string(), z.unknown()),
-        },
+        }),
         outputSchema: documentOutput,
         annotations: {
           readOnlyHint: false,
@@ -578,12 +596,12 @@ export function createArangoMcpServer(
         title: "Update a document",
         description:
           "Patch one document only if its current _rev matches, preventing lost updates.",
-        inputSchema: {
+        inputSchema: z.object({
           ...documentWriteInput,
           documentId: z.string().min(1),
           revision: z.string().min(1).describe("Expected current _rev"),
           patch: z.record(z.string(), z.unknown()),
-        },
+        }),
         outputSchema: documentOutput,
         annotations: {
           readOnlyHint: false,
@@ -612,11 +630,11 @@ export function createArangoMcpServer(
         title: "Delete a document",
         description:
           "Delete one document only if its current _rev matches and return operation metadata.",
-        inputSchema: {
+        inputSchema: z.object({
           ...documentWriteInput,
           documentId: z.string().min(1),
           revision: z.string().min(1).describe("Expected current _rev"),
-        },
+        }),
         outputSchema: documentOutput,
         annotations: {
           readOnlyHint: false,
@@ -655,7 +673,7 @@ export function createArangoMcpServer(
           openWorldHint: false,
         },
       },
-      async ({ databaseName, aql, bindVars, pageSize }, extra) => {
+      async ({ databaseName, aql, bindVars, pageSize }, ctx) => {
         log("warning", {
           operation: "readWriteQuery",
           databaseName,
@@ -663,7 +681,7 @@ export function createArangoMcpServer(
           bindVariableCount: Object.keys(bindVars).length,
         });
         const page = await safely("readWriteQuery", () =>
-          service.executeWriteQuery(databaseName, aql, bindVars, pageSize, extra.signal),
+          service.executeWriteQuery(databaseName, aql, bindVars, pageSize, ctx.mcpReq.signal),
         );
         return queryPageContent(page, config.maxBytes);
       },
@@ -768,9 +786,9 @@ export function createArangoMcpServer(
     {
       title: "Explore an ArangoDB database safely",
       description: "Guide a bounded, schema-first exploration of a database",
-      argsSchema: {
+      argsSchema: z.object({
         databaseName: z.string().min(1).describe("Database to explore"),
-      },
+      }),
     },
     async ({ databaseName }) => ({
       messages: [

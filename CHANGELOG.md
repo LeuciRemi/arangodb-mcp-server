@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- **Breaking:** require Node.js 22.19 or newer (Undici 8 and MCP Inspector 2 minimum; Node.js 20 is end-of-life). CI now tests Node.js 22, 24 and 26 and runs integration on Node.js 24 LTS.
+- Migrate from `@modelcontextprotocol/sdk` 1.32 to the MCP TypeScript SDK v2 (`@modelcontextprotocol/server` 2.3.1; `@modelcontextprotocol/client` 2.3.1 for tests): tool and prompt schemas are now Zod object schemas, `McpError` becomes `ProtocolError`, and handlers read cancellation from `ctx.mcpReq.signal`.
+- SDK v2 reports unknown tools as JSON-RPC errors (`-32602`) instead of `isError` tool results; the transport boundary now also redacts and size-bounds JSON-RPC error responses, dropping oversized error data first.
+- Update Undici to 8.12.3 and keep arangojs 10.6.0, Zod 4.6.7, TypeScript 7.0.2, nodemon 3.1.14 and shx 0.4.0 (already the latest majors). Drop the `@hono/node-server` and `fast-uri` overrides, which only applied to SDK v1 transitive dependencies.
+- Update the development MCP Inspector to 2.12.0, passing its server environment with `-e`; update GitHub Actions to `actions/checkout@v7` and `actions/setup-node@v7`, and pin `shell.nix` to `nodejs_24`.
+
 - Validate document selectors before HTTP requests to prevent collection-policy bypasses through path traversal.
 - Honor cancellation before write-query commit, preserve write results across page boundaries, and count in-flight continuations toward cursor capacity.
 - Apply request timeouts to all ArangoDB connections and include the runtime dependency required for HTTPS.

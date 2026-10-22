@@ -1,27 +1,42 @@
-/** Bound the serialized error result, including JSON escaping and its envelope. */
-export function boundedToolErrorResult(message, maxBytes) {
-    const resultFor = (text) => ({
-        content: [{ type: "text", text }],
-        isError: true,
-    });
-    const fits = (text) => Buffer.byteLength(JSON.stringify(resultFor(text)), "utf8") <= maxBytes;
+const TRUNCATION_SUFFIX = "… [truncated]";
+/** Return the longest prefix of message (plus a truncation marker) accepted by fits. */
+function truncateToFit(message, fits) {
     if (fits(message)) {
-        return resultFor(message);
+        return message;
     }
-    const suffix = "… [truncated]";
     let low = 0;
     let high = message.length;
     const prefix = (length) => message.slice(0, length).replace(/[\uD800-\uDBFF]$/u, "");
     while (low < high) {
         const middle = Math.ceil((low + high) / 2);
-        if (fits(prefix(middle) + suffix)) {
+        if (fits(prefix(middle) + TRUNCATION_SUFFIX)) {
             low = middle;
         }
         else {
             high = middle - 1;
         }
     }
-    return resultFor(prefix(low) + suffix);
+    return prefix(low) + TRUNCATION_SUFFIX;
+}
+/** Bound the serialized error result, including JSON escaping and its envelope. */
+export function boundedToolErrorResult(message, maxBytes) {
+    const resultFor = (text) => ({
+        content: [{ type: "text", text }],
+        isError: true,
+    });
+    return resultFor(truncateToFit(message, (text) => Buffer.byteLength(JSON.stringify(resultFor(text)), "utf8") <= maxBytes));
+}
+/**
+ * Bound a JSON-RPC error object. Error data is kept only when the complete
+ * error still fits; otherwise it is dropped before the message is truncated.
+ */
+export function boundedProtocolError(error, maxBytes) {
+    const size = (value) => Buffer.byteLength(JSON.stringify(value), "utf8");
+    if (size(error) <= maxBytes) {
+        return error;
+    }
+    const errorFor = (message) => ({ code: error.code, message });
+    return errorFor(truncateToFit(error.message, (text) => size(errorFor(text)) <= maxBytes));
 }
 function serializedEnvelopeBytes(result) {
     return Buffer.byteLength(JSON.stringify({

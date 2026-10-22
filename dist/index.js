@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { ConfigError, HelpRequested, parseConfig, USAGE } from "./src/config.js";
 import { createArangoMcpServer } from "./src/server.js";
 const require = createRequire(import.meta.url);

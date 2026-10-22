@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 
 import { parseConfig } from "../../dist/src/config.js";
 import { createArangoMcpServer } from "../../dist/src/server.js";
@@ -58,8 +58,20 @@ test("bounds SDK input validation and unknown-tool errors before callbacks run",
   assert.match(invalidInput.content[0].text, /truncated/);
   assert.equal(called, false);
 
-  const unknownTool = await client.callTool({ name: "missing".repeat(1000), arguments: {} });
-  assertBoundedError(unknownTool);
+  // MCP SDK v2 reports unknown tools as JSON-RPC protocol errors (-32602)
+  // instead of isError tool results; the transport boundary still bounds them.
+  await assert.rejects(
+    client.callTool({ name: "missing".repeat(1000), arguments: {} }),
+    (error) => {
+      assert.equal(error.code, -32602);
+      assert.ok(
+        Buffer.byteLength(JSON.stringify({ code: error.code, message: error.message }), "utf8") <=
+          1024,
+      );
+      assert.match(error.message, /truncated/);
+      return true;
+    },
+  );
 });
 
 test("bounds escaped UTF-8 backend errors and redacts credentials before truncating", async (t) => {
@@ -118,4 +130,24 @@ test("rejects decoded URI separators, controls and malformed encodings before da
     await assert.rejects(client.readResource({ uri }), /Invalid .*resource URI segment/, uri);
   }
   assert.equal(called, false);
+});
+
+test("bounds and redacts JSON-RPC resource errors at the transport boundary", async (t) => {
+  const { app, client } = await connect(t, {
+    ARANGO_MCP_MAX_BYTES: "1024",
+    ARANGO_USERNAME: "review-user",
+    ARANGO_PASSWORD: "review-secret",
+  });
+  app.service.describeCollection = async () => {
+    throw new Error(`review-secret ${"é😀".repeat(2000)}`);
+  };
+  await assert.rejects(client.readResource({ uri: "arangodb:///db/col" }), (error) => {
+    assert.ok(
+      Buffer.byteLength(JSON.stringify({ code: error.code, message: error.message }), "utf8") <=
+        1024,
+    );
+    assert.doesNotMatch(error.message, /review-secret/);
+    assert.match(error.message, /truncated/);
+    return true;
+  });
 });
