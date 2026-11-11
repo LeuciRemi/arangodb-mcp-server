@@ -29,6 +29,33 @@ test("parses a secure environment-based configuration", () => {
   assert.equal(config.credentialsFromCli, false);
 });
 
+test("derives the database allowlist from collection entries", () => {
+  const fromCollectionsOnly = parseConfig([], {
+    ARANGO_URL: "http://localhost:8529",
+    ARANGO_ALLOWED_COLLECTIONS: "analytics/events,reporting/totals",
+  });
+  assert.deepEqual([...fromCollectionsOnly.allowedDatabases].sort(), [
+    "analytics",
+    "reporting",
+  ]);
+
+  const narrowed = parseConfig([], {
+    ARANGO_URL: "http://localhost:8529",
+    ARANGO_ALLOWED_DATABASES: "analytics,reporting",
+    ARANGO_ALLOWED_COLLECTIONS: "analytics/events",
+  });
+  assert.deepEqual([...narrowed.allowedDatabases], ["analytics"]);
+
+  const emptyCollections = parseConfig([], {
+    ARANGO_URL: "http://localhost:8529",
+    ARANGO_ALLOWED_DATABASES: "analytics,reporting",
+  });
+  assert.deepEqual([...emptyCollections.allowedDatabases].sort(), [
+    "analytics",
+    "reporting",
+  ]);
+});
+
 test("keeps positional CLI compatibility and marks exposed credentials", () => {
   const config = parseConfig(
     [

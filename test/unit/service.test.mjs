@@ -169,6 +169,19 @@ test("does not start a write when the request is already cancelled", async (t) =
   assert.deepEqual(events, []);
 });
 
+test("rejects cancelled or non-allowlisted schema inference before querying", async (t) => {
+  const { service, events } = createService(t);
+  await assert.rejects(
+    service.inferSchema("test", "public", 10, AbortSignal.abort()),
+    /cancelled by the client/,
+  );
+  await assert.rejects(
+    service.inferSchema("test", "hidden", 10),
+    /Collection "test\/hidden" is not allowed by server policy/,
+  );
+  assert.deepEqual(events, []);
+});
+
 test("rolls back cancellation before execution and while draining write results", async (t) => {
   for (const stage of ["explain", "begin", "next"]) {
     await t.test(stage, async (t) => {

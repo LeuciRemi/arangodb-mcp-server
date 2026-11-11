@@ -2,7 +2,7 @@
 
 A safe, bounded [Model Context Protocol](https://modelcontextprotocol.io/) server for exploring and querying ArangoDB databases.
 
-The server is schema-first and read-only by default. It supports multiple databases, AQL bind variables, optimizer plans, structured MCP output, explicit document sampling, and cursor-based result pagination.
+The server is metadata-first and read-only by default. It supports multiple databases, AQL bind variables, optimizer plans, structured MCP output, graph and view discovery, in-database schema inference, explicit document sampling, and cursor-based result pagination.
 
 ## Safety model
 
@@ -12,9 +12,10 @@ The server is schema-first and read-only by default. It supports multiple databa
 - Collections reached only at runtime (`DOCUMENT()`, anonymous graph traversals) are absent from the optimizer plan; declare them in a leading `WITH` statement, otherwise ArangoDB fails with error 1652.
 - Allowlist entries for collections that do not exist are ignored instead of being declared, so a stale entry cannot fail every query in that database.
 - ArangoSearch (`arangosearch`) and `search-alias` views are queryable. A view is authorised through the collections it links, which must all be allowlisted. Queries run inside a stream transaction, so `OPTIONS { waitForSync: true }` is unavailable and freshly written documents become visible only once the view has indexed them.
+- `listGraphs` and `listViews` hide definitions that reach a collection outside the allowlist, and `inferSchema` runs as one aggregated read-only AQL query, so no document values leave ArangoDB.
 - Query time, memory, row count, serialized response size, buffered write-result size, cursor TTL, and active cursor count are capped.
 - Revision-safe document CRUD and arbitrary write-capable AQL are separate opt-in capabilities.
-- Database and collection allowlists can further restrict the ArangoDB user's permissions.
+- Database and collection allowlists can further restrict the ArangoDB user's permissions. Configuring a collection allowlist also restricts the server to the databases those entries belong to.
 - Queries and bind values are not written to logs.
 
 Use a dedicated ArangoDB user with **Read Only** collection permissions for the strongest database-side guarantee. Enabling the write tool does not grant permissions that the configured ArangoDB user does not already have.
@@ -23,18 +24,21 @@ Use a dedicated ArangoDB user with **Read Only** collection permissions for the 
 
 | Tool | Purpose | Default risk |
 | --- | --- | --- |
-| `listDatabases` | List databases visible to the user and policy | Read-only |
-| `listCollections` | List non-system collections | Read-only |
-| `describeCollection` | Return properties, count, JSON Schema, and indexes | Read-only |
+| `listDatabases` | List allowed databases as a string array | Read-only |
+| `listCollections` | List collection names, `document`/`edge` types, and document counts | Read-only |
+| `describeCollection` | Describe type, count, schema, computed values, and indexes; `verbose` adds raw properties and indexes | Read-only |
+| `inferSchema` | Infer field paths and per-type counts from the first N documents in storage order | Read-only |
+| `listGraphs` | List graphs with edge definitions and orphan collections | Read-only |
+| `listViews` | List ArangoSearch and search-alias views with read collections and compact links | Read-only |
 | `sampleDocuments` | Explicitly sample up to 20 documents with field projection | Read-only |
 | `explainQuery` | Validate and summarize a read-only AQL optimizer plan | Diagnostic opt-in |
-| `readQuery` | Execute bounded AQL in a read-only transaction | Read-only |
+| `readQuery` | Execute bounded AQL in a read-only transaction; `includeStats` adds statistics when the whole result fits the first page | Read-only |
 | `continueQuery` | Consume the next page from an opaque cursor | Read-only |
 | `healthCheck` | Report connectivity, version, policy, and limits | Diagnostic opt-in |
 | `insertDocument` | Insert one bounded document | Document-write opt-in |
 | `updateDocument` | Patch a document with mandatory `_rev` conflict protection | Document-write opt-in |
 | `deleteDocument` | Delete a document with mandatory `_rev` conflict protection | Document-write opt-in |
-| `readWriteQuery` | Execute arbitrary write-capable AQL | Separate higher-privilege opt-in |
+| `readWriteQuery` | Execute arbitrary write-capable AQL and report `writesExecuted`/`writesIgnored` | Separate higher-privilege opt-in |
 
 All tools provide MCP `outputSchema`, `structuredContent`, text fallback content, and risk annotations.
 
@@ -42,8 +46,9 @@ Document tools accept a document key or a `collection/key` identifier whose coll
 matches `collectionName`. Path separators inside keys, traversal segments, and URL
 query or fragment syntax are rejected before a request reaches ArangoDB.
 
-The default minimal profile exposes six tools: `listDatabases`, `listCollections`,
-`describeCollection`, `sampleDocuments`, `readQuery`, and `continueQuery`.
+The default minimal profile exposes nine tools: `listDatabases`, `listCollections`,
+`describeCollection`, `inferSchema`, `listGraphs`, `listViews`, `sampleDocuments`,
+`readQuery`, and `continueQuery`.
 Set `ARANGO_ENABLE_DIAGNOSTIC_TOOLS=true` (or pass
 `--enable-diagnostic-tools`) to additionally expose `explainQuery` and
 `healthCheck`.
@@ -52,12 +57,12 @@ Set `ARANGO_ENABLE_DIAGNOSTIC_TOOLS=true` (or pass
 
 Two application-controlled resource templates are exposed:
 
-- `arangodb:///{database}/{collection}` returns collection metadata without document samples.
+- `arangodb:///{database}/{collection}` returns the same compact collection object as a non-verbose `describeCollection` call, without document samples.
 - `arangodb:///{database}/{collection}/{documentId}` returns one explicitly addressed document.
 
 Database and collection template variables support MCP completion. Collections and documents are intentionally not enumerated through `resources/list`; the bounded listing tools should be used instead.
 
-The `exploreDatabase` prompt guides clients through a schema-first, bounded exploration.
+The `exploreDatabase` prompt guides clients through a metadata-first, bounded exploration.
 
 ## Installation from source
 
@@ -109,7 +114,7 @@ It emits a warning because CLI secrets may be visible to other local processes.
 | `ARANGO_ENABLE_READ_WRITE_QUERY` | `false` | Register arbitrary write-capable AQL (higher privilege) |
 | `ARANGO_ENABLE_WRITE` | `false` | Deprecated alias enabling document CRUD only |
 | `ARANGO_ENABLE_DIAGNOSTIC_TOOLS` | `false` | Register `explainQuery` and `healthCheck` |
-| `ARANGO_ALLOWED_DATABASES` | User-visible databases | Comma-separated database allowlist |
+| `ARANGO_ALLOWED_DATABASES` | User-visible databases | Comma-separated database allowlist; narrowed to the databases used by `ARANGO_ALLOWED_COLLECTIONS` when that is set |
 | `ARANGO_ALLOWED_COLLECTIONS` | User-visible collections | Comma-separated `database/collection` allowlist |
 | `ARANGO_MCP_MAX_ROWS` | `100` | Maximum rows in one result page |
 | `ARANGO_MCP_MAX_BYTES` | `512000` | Maximum serialized bytes in the complete MCP tool response envelope |
@@ -142,6 +147,8 @@ Use bind variables for values and collection names:
 }
 ```
 
+A query page contains `rows`, `rowCount`, `hasMore`, `nextCursor` only when another page exists, and `warnings` only when ArangoDB reports some. `readQuery` and `readWriteQuery` add `stats` only when `includeStats: true` is set. A streamed read reports statistics only when the whole result fits the first page; a paginated read never reports them. `readWriteQuery` reports statistics on its first page and also always reports `writesExecuted` and `writesIgnored`; continuation pages do not repeat either.
+
 When more rows are available, the result includes `hasMore: true` and an opaque `nextCursor`. Pass it to `continueQuery` before its TTL expires. Cursors are process-local and must not be persisted across server restarts.
 
 Write-query results are fully consumed into a private temporary spool before the transaction commits, so writes never depend on a client consuming every continuation page. If the spool would exceed `ARANGO_MCP_MAX_WRITE_SPOOL_BYTES`, the cursor is closed and the transaction is rolled back before any write becomes visible. Return fewer or smaller values from write AQL, or raise the limit deliberately when larger result sets are expected.
@@ -151,7 +158,7 @@ cancellation cannot guarantee rollback; a committed operation must not be retrie
 the assumption that cancellation undid it. Closing the MCP client cleans up remaining
 query sessions and temporary result files.
 
-`listDatabases` and `listCollections` also accept `limit` and an opaque `cursor`, and return `nextCursor` when another metadata page is available. Metadata cursors are bound to their list type, database context, and current access policy.
+`listDatabases`, `listCollections`, `listGraphs`, and `listViews` also accept `limit` and an opaque `cursor`, and return `nextCursor` when another metadata page is available. Document counts in `listCollections` cover only the returned page. Metadata cursors are bound to their list type, database context, and current access policy.
 
 ## Least-privilege ArangoDB user
 
@@ -165,15 +172,22 @@ users.grantCollection("mcp_reader", "analytics", "events", "ro");
 users.grantCollection("mcp_reader", "analytics", "accounts", "ro");
 ```
 
-The account does not need any access to `_system`: `listDatabases` reads the user-visible database list, and `healthCheck` reads the version from a database the user can see.
+The account does not need any access to `_system`: `listDatabases` reads the user-visible database list, and `healthCheck` reads the version from a database the user can see. When a collection allowlist is configured, only the databases owning those entries remain visible and queryable.
 
 Keep the database account read-only even when the MCP server's allowlists are configured; the two controls are complementary.
 
-## Migrating from 1.x
+## Migrating from 2.x
 
-Version 2.0 formalizes the structured, paginated response envelopes introduced by this branch. Clients should prefer `structuredContent` (query results are under `structuredContent.rows`; metadata lists use their named arrays and `nextCursor`). The text content also contains a compact JSON fallback for clients that do not yet expose `structuredContent` to the model.
+Version 3.0 makes every read-only response more compact and adds graph, view, and schema discovery. Apply these breaking changes to any client that reads `structuredContent`:
 
-The old `ARANGO_ENABLE_WRITE=true` setting now enables only targeted document CRUD. Set `ARANGO_ENABLE_READ_WRITE_QUERY=true` separately only when arbitrary destructive AQL is required. The complete MCP envelope, including both structured and text fallback content, remains bounded by `ARANGO_MCP_MAX_BYTES`.
+- Query pages (`readQuery`, `continueQuery`, `readWriteQuery`, `sampleDocuments`) no longer contain `bytes`. Empty `warnings` are omitted, `stats` is returned only with `includeStats: true`, and `nextCursor` only when another page exists. `readQuery` statistics appear only when the whole result fits the first page; a paginated read never reports them. `readWriteQuery` reports statistics on its first page and always returns `writesExecuted` and `writesIgnored` there.
+- `listDatabases` returns `{ databases: string[], totalDatabases, nextCursor? }`; the previous `{ name }` wrappers and `truncated` flag are gone.
+- `listCollections` returns `{ databaseName, collections: [{ name, type, count? }], totalCollections, nextCursor? }`. `type` is `"document"` or `"edge"`; numeric type and status, `isSystem`, and `truncated` are gone.
+- `describeCollection` returns a flat object (`type`, `documentCount`, optional `schema` and `computedValues`, and compact `indexes`). The `details` wrapper is gone. Pass `verbose: true` to add raw `properties` and `rawIndexes`. The collection resource returns the same compact object.
+- A collection allowlist now also acts as a database allowlist: databases without an allowlisted collection are neither listed nor queryable.
+- `inferSchema`, `listGraphs`, and `listViews` are part of the default profile. `inferSchema` scans the first N documents in storage order, not a random sample.
+
+Upgrading from 1.x: read the 2.0.0 entry in [CHANGELOG.md](CHANGELOG.md) for the structured-envelope and split write-profile changes, then apply the changes above.
 
 ## Development
 

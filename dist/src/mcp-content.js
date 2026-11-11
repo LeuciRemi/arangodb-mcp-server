@@ -47,11 +47,25 @@ function serializedEnvelopeBytes(result) {
 function jsonTextFallback(value) {
     return JSON.stringify(value);
 }
-export function queryPageResult(page) {
+/** The public query page: a subset of the service's internal bookkeeping. */
+function projectQueryPage(page, { includeStats = false, includeWriteStats = false }) {
+    return {
+        rows: page.rows,
+        rowCount: page.rowCount,
+        hasMore: page.hasMore,
+        ...(page.hasMore && page.nextCursor !== undefined
+            ? { nextCursor: page.nextCursor }
+            : {}),
+        ...(page.warnings.length > 0 ? { warnings: page.warnings } : {}),
+        ...(includeStats && page.stats ? { stats: page.stats } : {}),
+        ...(includeWriteStats && page.writeStats ? page.writeStats : {}),
+    };
+}
+export function queryPageResult(page, options = {}) {
     const continuation = page.hasMore
         ? " Use nextCursor with continueQuery to fetch the next page."
         : "";
-    const structuredContent = { ...page };
+    const structuredContent = projectQueryPage(page, options);
     return {
         content: [
             {
@@ -63,10 +77,12 @@ export function queryPageResult(page) {
     };
 }
 export function queryPageEnvelopeBytes(page) {
-    return serializedEnvelopeBytes(queryPageResult(page));
+    // Measure the superset the public projection can expose, so the service's
+    // envelope bookkeeping stays a valid upper bound.
+    return serializedEnvelopeBytes(queryPageResult(page, { includeStats: true, includeWriteStats: true }));
 }
-export function boundedQueryPageResult(page, maxBytes) {
-    const result = queryPageResult(page);
+export function boundedQueryPageResult(page, maxBytes, options = {}) {
+    const result = queryPageResult(page, options);
     const bytes = serializedEnvelopeBytes(result);
     if (bytes > maxBytes) {
         throw new Error(`Complete MCP tool response is ${bytes} bytes and exceeds the configured ${maxBytes}-byte limit`);

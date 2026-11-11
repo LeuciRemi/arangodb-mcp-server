@@ -2,8 +2,15 @@
 
 All notable changes to this project are documented here.
 
-## Unreleased
+## 3.0.0
 
+- **Breaking:** remove `bytes`, empty `warnings`, and unrequested `stats` from query pages. `readQuery` and `readWriteQuery` accept `includeStats`; streamed reads report statistics only when the whole result fits the first page, while `readWriteQuery` reports them on its first page and always returns `writesExecuted` and `writesIgnored` there.
+- **Breaking:** return `listDatabases` as `{ databases: string[], totalDatabases, nextCursor? }`, without `{ name }` wrappers or `truncated`.
+- **Breaking:** return `listCollections` entries as `{ name, type, count? }` with `document`/`edge` types and document counts for the returned page, dropping numeric type, status, `isSystem`, and `truncated`.
+- **Breaking:** return `describeCollection` as a flat compact object; add a `verbose` input for raw properties and index objects. The collection resource returns the same compact object.
+- **Breaking:** derive the database allowlist from collection allowlist entries, so databases without an allowlisted collection are neither listed nor queryable.
+- Add `listGraphs`, `listViews`, and `inferSchema` to the default read-only profile. Graph and view definitions that reach a non-allowlisted collection are hidden, and schema inference is one aggregated AQL query that keeps document values inside ArangoDB.
+- Replace long tool descriptions, server instructions, and the `exploreDatabase` prompt with a short metadata-first flow: databases, collections, description or inferred schema, then AQL with bind variables.
 - Update the MCP SDK to 2.4.0 and Undici to 8.12.4. Replace nodemon with a `tsc --watch` development loop (`dev/dev.mjs`), which removes the last development-only npm audit advisories.
 - List databases through `/_api/database/user` and report health from a visible database, so a least-privilege user without access to `_system` can list databases, run `healthCheck`, and query its own database.
 - Ignore allowlist entries for collections that do not exist instead of declaring them in the transaction, so one stale entry no longer fails every query in that database.

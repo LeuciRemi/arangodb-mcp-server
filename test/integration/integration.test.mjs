@@ -13,6 +13,7 @@ function createClient(
   collectionNames,
   {
     database = "_system",
+    databaseAllowlist = true,
     documentWrites = false,
     readWriteQuery = false,
     limits = {},
@@ -23,27 +24,33 @@ function createClient(
     ? collectionNames
     : [collectionNames]
   ).map((collectionName) => `${database}/${collectionName}`);
+  const env = {
+    ...process.env,
+    ARANGO_URL: url,
+    ARANGO_USERNAME: credentials.username,
+    ARANGO_PASSWORD: credentials.password,
+    ARANGO_ALLOWED_COLLECTIONS: allowedCollections.join(","),
+    ARANGO_MCP_MAX_ROWS: String(limits.maxRows ?? 2),
+    ARANGO_MCP_MAX_BYTES: String(limits.maxBytes ?? 65536),
+    ARANGO_MCP_MAX_WRITE_SPOOL_BYTES: String(
+      limits.maxWriteSpoolBytes ?? 16 * 1024 * 1024,
+    ),
+    ARANGO_MCP_MAX_ACTIVE_CURSORS: String(limits.maxActiveCursors ?? 32),
+    ARANGO_MCP_CURSOR_TTL: String(limits.cursorTtlSeconds ?? 30),
+    ARANGO_ENABLE_DOCUMENT_WRITES: documentWrites ? "true" : "false",
+    ARANGO_ENABLE_READ_WRITE_QUERY: readWriteQuery ? "true" : "false",
+    ARANGO_ENABLE_DIAGNOSTIC_TOOLS: "true",
+  };
+  if (databaseAllowlist) {
+    env.ARANGO_ALLOWED_DATABASES = database;
+  } else {
+    // Leave the database allowlist unset so parseConfig must derive it.
+    delete env.ARANGO_ALLOWED_DATABASES;
+  }
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: ["dist/index.js"],
-    env: {
-      ...process.env,
-      ARANGO_URL: url,
-      ARANGO_USERNAME: credentials.username,
-      ARANGO_PASSWORD: credentials.password,
-      ARANGO_ALLOWED_DATABASES: database,
-      ARANGO_ALLOWED_COLLECTIONS: allowedCollections.join(","),
-      ARANGO_MCP_MAX_ROWS: String(limits.maxRows ?? 2),
-      ARANGO_MCP_MAX_BYTES: String(limits.maxBytes ?? 65536),
-      ARANGO_MCP_MAX_WRITE_SPOOL_BYTES: String(
-        limits.maxWriteSpoolBytes ?? 16 * 1024 * 1024,
-      ),
-      ARANGO_MCP_MAX_ACTIVE_CURSORS: String(limits.maxActiveCursors ?? 32),
-      ARANGO_MCP_CURSOR_TTL: String(limits.cursorTtlSeconds ?? 30),
-      ARANGO_ENABLE_DOCUMENT_WRITES: documentWrites ? "true" : "false",
-      ARANGO_ENABLE_READ_WRITE_QUERY: readWriteQuery ? "true" : "false",
-      ARANGO_ENABLE_DIAGNOSTIC_TOOLS: "true",
-    },
+    env,
   });
   return {
     client: new Client(
@@ -52,6 +59,25 @@ function createClient(
     ),
     transport,
   };
+}
+
+/** Walk a paginated metadata list; every page must respect maxRows. */
+async function collectPages(client, name, arguments_, key) {
+  const items = [];
+  let cursor;
+  for (;;) {
+    const result = await client.callTool({
+      name,
+      arguments: { ...arguments_, ...(cursor ? { cursor } : {}) },
+    });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    assert.ok(result.structuredContent[key].length <= arguments_.limit ?? Infinity);
+    items.push(...result.structuredContent[key]);
+    cursor = result.structuredContent.nextCursor;
+    if (!cursor) {
+      return items;
+    }
+  }
 }
 
 async function waitForViewDocuments(database, viewName, expectedCount, timeoutMs = 30_000) {
@@ -89,7 +115,9 @@ test(
       `${collectionName}_c`,
     ];
     const collection = admin.collection(collectionName);
-    await collection.create();
+    await collection.create({
+      schema: { rule: { properties: {} }, level: "moderate", message: "example" },
+    });
     await admin.collection(metadataCollectionNames[1]).create();
     await admin.collection(metadataCollectionNames[2]).create();
     await collection.save([
@@ -109,6 +137,13 @@ test(
       assert.equal(firstCollectionPage.structuredContent.collections.length, 2);
       assert.equal(firstCollectionPage.structuredContent.totalCollections, 3);
       assert.ok(firstCollectionPage.structuredContent.nextCursor);
+      for (const collection of firstCollectionPage.structuredContent.collections) {
+        assert.equal(collection.type, "document");
+        assert.equal(typeof collection.count, "number");
+        assert.equal(collection.isSystem, undefined);
+        assert.equal(collection.status, undefined);
+      }
+      assert.equal(firstCollectionPage.structuredContent.truncated, undefined);
       const secondCollectionPage = await client.callTool({
         name: "listCollections",
         arguments: {
@@ -118,7 +153,7 @@ test(
         },
       });
       assert.equal(secondCollectionPage.structuredContent.collections.length, 1);
-      assert.equal(secondCollectionPage.structuredContent.truncated, false);
+      assert.equal(secondCollectionPage.structuredContent.nextCursor, undefined);
 
       const first = await client.callTool({
         name: "readQuery",
@@ -136,6 +171,9 @@ test(
       );
       assert.equal(first.structuredContent.hasMore, true);
       assert.ok(first.structuredContent.nextCursor);
+      assert.equal(first.structuredContent.bytes, undefined);
+      assert.equal(first.structuredContent.warnings, undefined);
+      assert.equal(first.structuredContent.stats, undefined);
 
       const second = await client.callTool({
         name: "continueQuery",
@@ -199,10 +237,47 @@ test(
       assert.equal(sampled.structuredContent.rows.length, 2);
       assert.equal(sampled.structuredContent.rows[0].privateField, undefined);
 
+      const described = await client.callTool({
+        name: "describeCollection",
+        arguments: { databaseName: "_system", collectionName },
+      });
+      assert.notEqual(described.isError, true, JSON.stringify(described.content));
+      const compact = described.structuredContent;
+      assert.deepEqual(Object.keys(compact).sort(), [
+        "collectionName",
+        "databaseName",
+        "documentCount",
+        "indexes",
+        "schema",
+        "type",
+      ]);
+      assert.equal(compact.type, "document");
+      assert.equal(compact.documentCount, 3);
+      assert.equal(compact.details, undefined);
+      assert.equal(compact.properties, undefined);
+      assert.equal(compact.rawIndexes, undefined);
+      assert.equal(compact.schema.level, "moderate");
+      assert.ok(compact.indexes.some((index) => index.type === "primary"));
+
+      const verbose = await client.callTool({
+        name: "describeCollection",
+        arguments: { databaseName: "_system", collectionName, verbose: true },
+      });
+      assert.equal(typeof verbose.structuredContent.properties, "object");
+      assert.equal(
+        verbose.structuredContent.rawIndexes.length,
+        verbose.structuredContent.indexes.length,
+      );
+      assert.deepEqual(
+        verbose.structuredContent.indexes,
+        compact.indexes,
+      );
+
       const resource = await client.readResource({
         uri: `arangodb:///_system/${collectionName}`,
       });
       const metadata = JSON.parse(resource.contents[0].text);
+      assert.deepEqual(metadata, compact);
       assert.equal(metadata.documentCount, 3);
       assert.ok(Array.isArray(metadata.indexes));
       assert.equal(metadata.sampleDocuments, undefined);
@@ -460,6 +535,8 @@ test(
         },
       });
       assert.notEqual(inserted.isError, true, JSON.stringify(inserted.content));
+      assert.equal(inserted.structuredContent.writesExecuted, 1);
+      assert.equal(inserted.structuredContent.writesIgnored, 0);
       assert.equal((await collection.document("written")).value, 42);
 
       const paginatedInsert = await client.callTool({
@@ -477,6 +554,8 @@ test(
         JSON.stringify(paginatedInsert.content),
       );
       assert.equal(paginatedInsert.structuredContent.hasMore, true);
+      assert.equal(paginatedInsert.structuredContent.writesExecuted, 3);
+      assert.equal(paginatedInsert.structuredContent.writesIgnored, 0);
       assert.ok(paginatedInsert.structuredContent.nextCursor);
       assert.deepEqual(
         await Promise.all(
@@ -505,6 +584,7 @@ test(
         ["page-2", "page-3"],
       );
       assert.equal(paginatedContinuation.structuredContent.hasMore, false);
+      assert.equal(paginatedContinuation.structuredContent.writesExecuted, undefined);
 
       const oversizedWriteResult = await client.callTool({
         name: "readWriteQuery",
@@ -885,10 +965,9 @@ test(
 
       const databases = await client.callTool({ name: "listDatabases", arguments: {} });
       assert.notEqual(databases.isError, true, JSON.stringify(databases.content));
-      assert.deepEqual(
-        databases.structuredContent.databases.map(({ name }) => name),
-        [databaseName],
-      );
+      assert.deepEqual(databases.structuredContent.databases, [databaseName]);
+      assert.equal(databases.structuredContent.totalDatabases, 1);
+      assert.equal(databases.structuredContent.nextCursor, undefined);
 
       const health = await client.callTool({ name: "healthCheck", arguments: {} });
       assert.notEqual(health.isError, true, JSON.stringify(health.content));
@@ -1023,6 +1102,308 @@ test(
           admin.collection(name).drop().catch(() => undefined)
         ),
       );
+      admin.close();
+    }
+  },
+);
+
+test(
+  "lists graphs and views under the collection allowlist and infers schemas",
+  { skip: !url, timeout: 90_000 },
+  async () => {
+    const admin = new Database({
+      url,
+      databaseName: "_system",
+      auth: { username, password },
+    });
+    const suffix = `${Date.now()}`;
+    const verticesA = `mcp_graph_a_${suffix}`;
+    const verticesB = `mcp_graph_b_${suffix}`;
+    const orphan = `mcp_graph_orphan_${suffix}`;
+    const forbiddenVertices = `mcp_graph_forbidden_${suffix}`;
+    const allowedEdges = `mcp_graph_edges_${suffix}`;
+    const forbiddenEdges = `mcp_graph_forbidden_edges_${suffix}`;
+    const mixedEdges = `mcp_graph_mixed_edges_${suffix}`;
+    const documents = `mcp_schema_docs_${suffix}`;
+    const allowedGraphName = `mcp_graph_allowed_${suffix}`;
+    const forbiddenGraphName = `mcp_graph_forbidden_${suffix}`;
+    const mixedGraphName = `mcp_graph_mixed_${suffix}`;
+    const allowedViewName = `mcp_view_allowed_${suffix}`;
+    const forbiddenViewName = `mcp_view_forbidden_${suffix}`;
+    const aliasViewName = `mcp_view_alias_${suffix}`;
+    const indexName = `mcp_view_index_${suffix}`;
+    const allowedCollections = [
+      verticesA,
+      verticesB,
+      orphan,
+      allowedEdges,
+      mixedEdges,
+      documents,
+    ];
+    const droppedCollections = [
+      ...allowedCollections,
+      forbiddenVertices,
+      forbiddenEdges,
+    ];
+
+    await Promise.all([
+      admin.collection(verticesA).create(),
+      admin.collection(verticesB).create(),
+      admin.collection(orphan).create(),
+      admin.collection(forbiddenVertices).create(),
+      admin.createEdgeCollection(allowedEdges),
+      admin.createEdgeCollection(forbiddenEdges),
+      admin.createEdgeCollection(mixedEdges),
+      admin.collection(documents).create(),
+    ]);
+    await admin.collection(documents).save([
+      { _key: "a", name: "x", address: { city: "Paris" }, tags: [{ name: "t" }], score: 1, nil: null },
+      { _key: "b", name: "y", address: { city: "Lyon", zip: "1" }, tags: [], score: "high" },
+      { _key: "c", tags: ["plain"], score: 2.5, flag: true },
+    ]);
+    await admin.collection(documents).ensureIndex({
+      type: "inverted",
+      name: indexName,
+      fields: ["name"],
+    });
+    const allowedGraph = admin.graph(allowedGraphName);
+    const forbiddenGraph = admin.graph(forbiddenGraphName);
+    const mixedGraph = admin.graph(mixedGraphName);
+    await allowedGraph.create([
+      { collection: allowedEdges, from: [verticesA], to: [verticesB] },
+    ]);
+    await allowedGraph.addVertexCollection(orphan);
+    await forbiddenGraph.create([
+      { collection: forbiddenEdges, from: [forbiddenVertices], to: [forbiddenVertices] },
+    ]);
+    await mixedGraph.create([
+      { collection: mixedEdges, from: [verticesA], to: [forbiddenVertices] },
+    ]);
+    await admin.createView(allowedViewName, {
+      type: "arangosearch",
+      links: {
+        [documents]: { includeAllFields: true },
+        [verticesA]: {
+          fields: { name: { analyzers: ["identity"] } },
+          storeValues: "id",
+          trackListPositions: true,
+        },
+      },
+      primarySort: [{ field: "name", direction: "asc" }],
+    });
+    await admin.createView(forbiddenViewName, {
+      type: "arangosearch",
+      links: { [forbiddenVertices]: { includeAllFields: true } },
+    });
+    await admin.createView(aliasViewName, {
+      type: "search-alias",
+      indexes: [{ collection: documents, index: indexName }],
+    });
+
+    const { client, transport } = createClient(allowedCollections);
+    try {
+      await client.connect(transport);
+
+      const listedCollections = await collectPages(
+        client,
+        "listCollections",
+        { databaseName: "_system", limit: 2 },
+        "collections",
+      );
+      assert.deepEqual(
+        listedCollections.map(({ name }) => name).sort(),
+        [...allowedCollections].sort(),
+      );
+      assert.equal(
+        listedCollections.find(({ name }) => name === documents)?.count,
+        3,
+      );
+
+      const listedGraphs = await collectPages(
+        client,
+        "listGraphs",
+        { databaseName: "_system", limit: 2 },
+        "graphs",
+      );
+      const graphNames = listedGraphs.map(({ name }) => name);
+      assert.ok(graphNames.includes(allowedGraphName));
+      assert.ok(!graphNames.includes(forbiddenGraphName));
+      assert.ok(
+        !graphNames.includes(mixedGraphName),
+        "a graph reading a non-allowlisted collection must be hidden",
+      );
+      const allowed = listedGraphs.find(({ name }) => name === allowedGraphName);
+      assert.deepEqual(allowed.edgeDefinitions, [
+        { collection: allowedEdges, from: [verticesA], to: [verticesB] },
+      ]);
+      assert.deepEqual(allowed.orphanCollections, [orphan]);
+
+      const listedViews = await collectPages(
+        client,
+        "listViews",
+        { databaseName: "_system", limit: 2 },
+        "views",
+      );
+      const viewNames = listedViews.map(({ name }) => name);
+      assert.ok(viewNames.includes(allowedViewName));
+      assert.ok(viewNames.includes(aliasViewName));
+      assert.ok(
+        !viewNames.includes(forbiddenViewName),
+        "a view linked to a non-allowlisted collection must be hidden",
+      );
+      const arangosearch = listedViews.find(({ name }) => name === allowedViewName);
+      assert.deepEqual(arangosearch.collections, [documents, verticesA].sort());
+      assert.equal(arangosearch.links[documents].includeAllFields, true);
+      assert.equal(arangosearch.links[documents].storeValues, undefined);
+      assert.equal(arangosearch.links[documents].trackListPositions, undefined);
+      assert.deepEqual(arangosearch.links[verticesA].fields, { name: {} });
+      assert.equal(arangosearch.links[verticesA].storeValues, "id");
+      assert.equal(arangosearch.links[verticesA].trackListPositions, true);
+      assert.equal(arangosearch.primarySort[0].field, "name");
+      const alias = listedViews.find(({ name }) => name === aliasViewName);
+      assert.deepEqual(alias.collections, [documents]);
+      assert.deepEqual(alias.indexes, [{ collection: documents, index: indexName }]);
+
+      const schema = await client.callTool({
+        name: "inferSchema",
+        arguments: { databaseName: "_system", collectionName: documents, sampleSize: 100 },
+      });
+      assert.notEqual(schema.isError, true, JSON.stringify(schema.content));
+      assert.equal(schema.structuredContent.sampledDocuments, 3);
+      assert.equal(schema.structuredContent.truncated, false);
+      assert.deepEqual(schema.structuredContent.fields, [
+        { path: "_id", types: { string: 3 } },
+        { path: "_key", types: { string: 3 } },
+        { path: "_rev", types: { string: 3 } },
+        { path: "address", types: { object: 2 } },
+        { path: "address.city", types: { string: 2 } },
+        { path: "address.zip", types: { string: 1 } },
+        { path: "flag", types: { bool: 1 } },
+        { path: "name", types: { string: 2 } },
+        { path: "nil", types: { null: 1 } },
+        { path: "score", types: { number: 2, string: 1 } },
+        { path: "tags", types: { array: 3 } },
+        { path: "tags[].name", types: { string: 1 } },
+      ]);
+
+      const limited = await client.callTool({
+        name: "inferSchema",
+        arguments: { databaseName: "_system", collectionName: documents, sampleSize: 1 },
+      });
+      assert.equal(limited.structuredContent.sampledDocuments, 1);
+      assert.deepEqual(limited.structuredContent.fields, [
+        { path: "_id", types: { string: 1 } },
+        { path: "_key", types: { string: 1 } },
+        { path: "_rev", types: { string: 1 } },
+        { path: "address", types: { object: 1 } },
+        { path: "address.city", types: { string: 1 } },
+        { path: "name", types: { string: 1 } },
+        { path: "nil", types: { null: 1 } },
+        { path: "score", types: { number: 1 } },
+        { path: "tags", types: { array: 1 } },
+        { path: "tags[].name", types: { string: 1 } },
+      ]);
+
+      const refused = await client.callTool({
+        name: "inferSchema",
+        arguments: {
+          databaseName: "_system",
+          collectionName: forbiddenVertices,
+          sampleSize: 10,
+        },
+      });
+      assert.equal(refused.isError, true);
+      assert.match(refused.content[0].text, /is not allowed by server policy/);
+      assert.match(refused.content[0].text, new RegExp(forbiddenVertices));
+    } finally {
+      await client.close().catch(() => undefined);
+      await Promise.all(
+        [allowedViewName, forbiddenViewName, aliasViewName].map((name) =>
+          admin.view(name).drop().catch(() => undefined),
+        ),
+      );
+      await Promise.all(
+        [allowedGraphName, forbiddenGraphName, mixedGraphName].map((name) =>
+          admin.graph(name).drop().catch(() => undefined),
+        ),
+      );
+      await Promise.all(
+        droppedCollections.map((name) =>
+          admin.collection(name).drop().catch(() => undefined),
+        ),
+      );
+      admin.close();
+    }
+  },
+);
+
+test(
+  "derives the database allowlist from collection entries",
+  { skip: !url, timeout: 60_000 },
+  async () => {
+    const admin = new Database({
+      url,
+      databaseName: "_system",
+      auth: { username, password },
+    });
+    const suffix = `${Date.now()}`;
+    const visibleDatabase = `mcp_policy_visible_${suffix}`;
+    const hiddenDatabase = `mcp_policy_hidden_${suffix}`;
+    const collectionName = "documents";
+    let visible;
+    try {
+      visible = await admin.createDatabase(visibleDatabase);
+      const hidden = await admin.createDatabase(hiddenDatabase);
+      await hidden.collection(collectionName).create();
+      await visible.collection(collectionName).create();
+      await visible.collection(collectionName).save({ _key: "kept", value: 1 });
+      hidden.close();
+
+      const { client, transport } = createClient(collectionName, {
+        database: visibleDatabase,
+        databaseAllowlist: false,
+      });
+      try {
+        await client.connect(transport);
+
+        const databases = await client.callTool({
+          name: "listDatabases",
+          arguments: {},
+        });
+        assert.notEqual(databases.isError, true, JSON.stringify(databases.content));
+        assert.deepEqual(databases.structuredContent.databases, [visibleDatabase]);
+
+        const rejected = await client.callTool({
+          name: "readQuery",
+          arguments: {
+            databaseName: hiddenDatabase,
+            aql: "FOR doc IN @@collection RETURN doc",
+            bindVars: { "@collection": collectionName },
+          },
+        });
+        assert.equal(rejected.isError, true);
+        assert.match(
+          rejected.content[0].text,
+          new RegExp(`Database "${hiddenDatabase}" is not allowed by server policy`),
+        );
+
+        const accepted = await client.callTool({
+          name: "readQuery",
+          arguments: {
+            databaseName: visibleDatabase,
+            aql: "FOR doc IN @@collection RETURN doc._key",
+            bindVars: { "@collection": collectionName },
+          },
+        });
+        assert.notEqual(accepted.isError, true, JSON.stringify(accepted.content));
+        assert.deepEqual(accepted.structuredContent.rows, ["kept"]);
+      } finally {
+        await client.close().catch(() => undefined);
+      }
+    } finally {
+      visible?.close();
+      await admin.dropDatabase(visibleDatabase).catch(() => undefined);
+      await admin.dropDatabase(hiddenDatabase).catch(() => undefined);
       admin.close();
     }
   },

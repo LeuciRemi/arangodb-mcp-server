@@ -24,6 +24,60 @@ function splitPlannedViews(plan) {
 function asRecord(value) {
     return value && typeof value === "object" ? value : {};
 }
+function isNonEmptyRecord(value) {
+    return Object.keys(asRecord(value)).length > 0;
+}
+function collectionNames(value) {
+    const values = Array.isArray(value) ? value : [value];
+    return values
+        .map((item) => (typeof item === "string" ? item : asRecord(item).name))
+        .filter((name) => typeof name === "string");
+}
+function collectionName(value) {
+    return collectionNames(value)[0] ?? "";
+}
+function sortByName(left, right) {
+    return left.name < right.name ? -1 : left.name > right.name ? 1 : 0;
+}
+// One aggregated query so no document value ever leaves ArangoDB: the server
+// only sees per-path type counts. It scans the first @sampleSize documents in
+// storage order (not a random sample) and always returns a single row.
+const INFER_SCHEMA_QUERY = `LET documents = (FOR document IN @@collection LIMIT @sampleSize RETURN document)
+LET entries = UNION(
+  (FOR document IN documents
+    FOR attribute IN ATTRIBUTES(document, false, true)
+    RETURN { path: attribute, type: TYPENAME(document[attribute]) }),
+  (FOR document IN documents
+    FOR attribute IN ATTRIBUTES(document, false, true)
+    FILTER IS_OBJECT(document[attribute])
+    FOR nested IN ATTRIBUTES(document[attribute], false, true)
+    RETURN {
+      path: CONCAT(attribute, ".", nested),
+      type: TYPENAME(document[attribute][nested])
+    }),
+  (FOR document IN documents
+    FOR attribute IN ATTRIBUTES(document, false, true)
+    FILTER IS_ARRAY(document[attribute])
+      AND LENGTH(document[attribute]) > 0
+      AND IS_OBJECT(document[attribute][0])
+    FOR nested IN ATTRIBUTES(document[attribute][0], false, true)
+    RETURN {
+      path: CONCAT(attribute, "[].", nested),
+      type: TYPENAME(document[attribute][0][nested])
+    })
+)
+LET allFields = (
+  FOR entry IN entries
+  COLLECT path = entry.path, type = entry.type WITH COUNT INTO count
+  COLLECT field = path INTO groups
+  SORT field ASC
+  RETURN { path: field, types: ZIP(groups[*].type, groups[*].count) }
+)
+RETURN {
+  sampledDocuments: LENGTH(documents),
+  fields: SLICE(allFields, 0, 200),
+  truncated: LENGTH(allFields) > 200
+}`;
 function operationMetadata(value) {
     const record = asRecord(value);
     return Object.fromEntries(["_id", "_key", "_rev", "_oldRev"].flatMap((field) => record[field] === undefined ? [] : [[field, record[field]]]));
@@ -101,10 +155,13 @@ export class ArangoDBService {
         }
         return key;
     }
+    isCollectionAllowed(databaseName, collectionName) {
+        return (this.config.allowedCollections.size === 0 ||
+            this.config.allowedCollections.has(`${databaseName}/${collectionName}`));
+    }
     assertCollectionAllowed(databaseName, collectionName) {
         this.assertDatabaseAllowed(databaseName);
-        if (this.config.allowedCollections.size > 0 &&
-            !this.config.allowedCollections.has(`${databaseName}/${collectionName}`)) {
+        if (!this.isCollectionAllowed(databaseName, collectionName)) {
             throw new UserFacingError(`Collection "${databaseName}/${collectionName}" is not allowed by server policy`);
         }
     }
@@ -161,15 +218,122 @@ export class ArangoDBService {
         const database = this.getDatabase(databaseName);
         const collections = await database.listCollections(true);
         return collections
-            .filter((collection) => this.config.allowedCollections.size === 0 ||
-            this.config.allowedCollections.has(`${databaseName}/${collection.name}`))
+            .filter((collection) => this.isCollectionAllowed(databaseName, collection.name))
             .map((collection) => ({
             name: collection.name,
-            type: collection.type,
-            status: collection.status,
-            isSystem: collection.isSystem,
+            type: collection.type === 3 ? "edge" : "document",
         }))
-            .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+            .sort(sortByName);
+    }
+    async collectionCounts(databaseName, collectionNames) {
+        const database = this.getDatabase(databaseName);
+        const counts = await Promise.all(collectionNames.map(async (collectionName) => {
+            try {
+                const count = await database.collection(collectionName).count();
+                return [collectionName, count.count];
+            }
+            catch {
+                // A missing count must not hide the rest of the collection list.
+                return undefined;
+            }
+        }));
+        return Object.fromEntries(counts.filter((entry) => entry !== undefined));
+    }
+    async listGraphs(databaseName) {
+        const database = this.getDatabase(databaseName);
+        const graphs = await database.listGraphs();
+        return graphs
+            .filter((graph) => [
+            ...graph.edgeDefinitions.flatMap((edge) => [
+                collectionName(edge.collection),
+                ...collectionNames(edge.from),
+                ...collectionNames(edge.to),
+            ]),
+            ...graph.orphanCollections,
+        ].every((collectionName) => this.isCollectionAllowed(databaseName, collectionName)))
+            .map((graph) => ({
+            name: graph.name,
+            edgeDefinitions: graph.edgeDefinitions.map((edge) => ({
+                collection: collectionName(edge.collection),
+                from: collectionNames(edge.from),
+                to: collectionNames(edge.to),
+            })),
+            ...(graph.orphanCollections.length > 0
+                ? { orphanCollections: graph.orphanCollections }
+                : {}),
+        }))
+            .sort(sortByName);
+    }
+    async listViews(databaseName) {
+        const database = this.getDatabase(databaseName);
+        const descriptions = await database.listViews();
+        const views = await Promise.all(descriptions.map(async (description) => {
+            const properties = asRecord(await database.view(description.name).properties());
+            if (description.type === "search-alias") {
+                const indexes = (Array.isArray(properties.indexes) ? properties.indexes : []).map((index) => {
+                    const record = asRecord(index);
+                    return {
+                        collection: String(record.collection),
+                        index: String(record.index),
+                    };
+                });
+                return {
+                    name: description.name,
+                    type: description.type,
+                    collections: [...new Set(indexes.map((index) => index.collection))].sort(),
+                    indexes,
+                };
+            }
+            const links = asRecord(properties.links);
+            const compactLinks = Object.fromEntries(Object.entries(links).map(([collection, link]) => {
+                const definition = { ...asRecord(link) };
+                // Drop defaults and per-link noise; nested field definitions stay.
+                if (definition.storeValues === "none") {
+                    delete definition.storeValues;
+                }
+                if (definition.trackListPositions === false) {
+                    delete definition.trackListPositions;
+                }
+                if (!isNonEmptyRecord(definition.fields)) {
+                    delete definition.fields;
+                }
+                return [collection, definition];
+            }));
+            const primarySort = Array.isArray(properties.primarySort)
+                ? properties.primarySort.map((entry) => asRecord(entry))
+                : [];
+            return {
+                name: description.name,
+                type: description.type,
+                collections: Object.keys(links).sort(),
+                ...(Object.keys(compactLinks).length > 0 ? { links: compactLinks } : {}),
+                ...(primarySort.length > 0 ? { primarySort } : {}),
+            };
+        }));
+        return views
+            .filter((view) => view.collections.every((collectionName) => this.isCollectionAllowed(databaseName, collectionName)))
+            .sort(sortByName);
+    }
+    async inferSchema(databaseName, collectionName, sampleSize, signal) {
+        this.assertCollectionAllowed(databaseName, collectionName);
+        if (!Number.isSafeInteger(sampleSize) || sampleSize < 1 || sampleSize > 1_000) {
+            throw new UserFacingError("sampleSize must be an integer between 1 and 1000");
+        }
+        const page = await this.executeReadQuery(databaseName, INFER_SCHEMA_QUERY, { "@collection": collectionName, sampleSize }, 1, signal);
+        const result = asRecord(page.rows[0]);
+        return {
+            sampledDocuments: typeof result.sampledDocuments === "number" ? result.sampledDocuments : 0,
+            fields: Array.isArray(result.fields)
+                ? result.fields.map((field) => {
+                    const record = asRecord(field);
+                    return {
+                        path: String(record.path),
+                        types: asRecord(record.types),
+                    };
+                })
+                : [],
+            truncated: result.truncated === true,
+        };
     }
     async describeCollection(databaseName, collectionName) {
         this.assertCollectionAllowed(databaseName, collectionName);
@@ -529,14 +693,22 @@ export class ArangoDBService {
             bytes += itemBytes;
         }
         const extra = session.cursor.extra ?? {};
+        const stats = extra.stats ? asRecord(extra.stats) : undefined;
         const page = {
             rows,
             rowCount: rows.length,
             bytes,
             hasMore: this.sessionHasMore(session),
             warnings: Array.isArray(extra.warnings) ? extra.warnings : [],
-            stats: extra.stats ? asRecord(extra.stats) : undefined,
+            stats,
         };
+        if (session.isWrite) {
+            // Kept apart from stats so envelope trimming cannot hide the counts.
+            page.writeStats = {
+                writesExecuted: typeof stats?.writesExecuted === "number" ? stats.writesExecuted : 0,
+                writesIgnored: typeof stats?.writesIgnored === "number" ? stats.writesIgnored : 0,
+            };
+        }
         if (page.hasMore) {
             page.nextCursor = session.token;
         }

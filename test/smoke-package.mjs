@@ -99,7 +99,7 @@ try {
     { timeout: 10_000 },
   );
   assert.notEqual(databases.isError, true, JSON.stringify(databases.content));
-  assert.deepEqual(databases.structuredContent.databases, [{ name: "package_smoke" }]);
+  assert.deepEqual(databases.structuredContent.databases, ["package_smoke"]);
   assert.equal(databaseRequests, 1);
 } finally {
   await client?.close();

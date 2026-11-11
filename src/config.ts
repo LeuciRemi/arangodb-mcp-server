@@ -209,7 +209,7 @@ export function parseConfig(
     throw new ConfigError("An ArangoDB password requires a username");
   }
 
-  const allowedDatabases = cliDatabases.size
+  let allowedDatabases = cliDatabases.size
     ? cliDatabases
     : parseCsv(env.ARANGO_ALLOWED_DATABASES);
   const allowedCollections = cliCollections.size
@@ -223,6 +223,13 @@ export function parseConfig(
         `Collection allowlist database "${database}" is not in ARANGO_ALLOWED_DATABASES`,
       );
     }
+  }
+  // A collection allowlist is a database allowlist: a database without an
+  // allowlisted collection exposes nothing usable, so it is out of policy.
+  if (allowedCollections.size > 0) {
+    allowedDatabases = new Set(
+      [...allowedCollections].map((entry) => entry.slice(0, entry.indexOf("/"))),
+    );
   }
 
   const maxRuntimeSeconds = parsePositiveInteger(

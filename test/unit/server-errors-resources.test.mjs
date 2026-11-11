@@ -99,9 +99,8 @@ test("decodes resource URI names and document keys exactly once", async (t) => {
     databaseName, collectionName, documentId,
   });
   const metadata = await client.readResource({ uri: "arangodb:///donn%C3%A9es/caf%C3%A9" });
-  assert.deepEqual(JSON.parse(metadata.contents[0].text), {
-    databaseName: "données", collectionName: "café",
-  });
+  assert.equal(JSON.parse(metadata.contents[0].text).databaseName, "données");
+  assert.equal(JSON.parse(metadata.contents[0].text).collectionName, "café");
   const document = await client.readResource({ uri: "arangodb:///db/caf%C3%A9/key%3A1" });
   assert.deepEqual(JSON.parse(document.contents[0].text), {
     databaseName: "db", collectionName: "café", documentId: "key:1",

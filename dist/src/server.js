@@ -49,11 +49,33 @@ const warningSchema = z.object({
 const queryOutputSchema = z.object({
     rows: z.array(z.unknown()),
     rowCount: z.number().int().nonnegative(),
-    bytes: z.number().int().nonnegative(),
     hasMore: z.boolean(),
     nextCursor: z.string().optional(),
-    warnings: z.array(warningSchema),
+    warnings: z.array(warningSchema).optional(),
     stats: z.record(z.string(), z.unknown()).optional(),
+});
+const writeQueryOutputSchema = queryOutputSchema.extend({
+    writesExecuted: z.number(),
+    writesIgnored: z.number(),
+});
+const collectionIndexSchema = z.object({
+    name: z.string(),
+    type: z.string(),
+    fields: z.array(z.string()),
+    unique: z.boolean().optional(),
+    sparse: z.boolean().optional(),
+    expireAfter: z.number().optional(),
+});
+const describeCollectionOutputSchema = z.object({
+    databaseName: z.string(),
+    collectionName: z.string(),
+    type: z.enum(["document", "edge"]),
+    documentCount: z.number().int().nonnegative(),
+    schema: z.record(z.string(), z.unknown()).optional(),
+    computedValues: z.unknown().optional(),
+    indexes: z.array(collectionIndexSchema),
+    properties: z.record(z.string(), z.unknown()).optional(),
+    rawIndexes: z.array(z.record(z.string(), z.unknown())).optional(),
 });
 const readOnlyAnnotations = {
     readOnlyHint: true,
@@ -61,11 +83,54 @@ const readOnlyAnnotations = {
     idempotentHint: true,
     openWorldHint: false,
 };
-function queryPageContent(page, maxBytes) {
-    return boundedQueryPageResult(page, maxBytes);
+function queryPageContent(page, maxBytes, options = {}) {
+    return boundedQueryPageResult(page, maxBytes, options);
 }
 function objectContent(structuredContent, maxBytes) {
     return boundedObjectResult(structuredContent, maxBytes);
+}
+function recordOf(value) {
+    return value && typeof value === "object" && !Array.isArray(value)
+        ? value
+        : {};
+}
+/** Project the service's raw collection description onto the compact contract. */
+function compactCollectionDescription(details, verbose) {
+    const properties = recordOf(details.properties);
+    const rawIndexes = (Array.isArray(details.indexes) ? details.indexes : []).map(recordOf);
+    const computedValues = properties.computedValues;
+    const hasComputedValues = Array.isArray(computedValues)
+        ? computedValues.length > 0
+        : computedValues !== null &&
+            typeof computedValues === "object" &&
+            Object.keys(computedValues).length > 0;
+    return {
+        databaseName: details.databaseName,
+        collectionName: details.collectionName,
+        type: properties.type === 3 ? "edge" : "document",
+        documentCount: details.documentCount,
+        ...(properties.schema && typeof properties.schema === "object"
+            ? { schema: properties.schema }
+            : {}),
+        ...(hasComputedValues ? { computedValues } : {}),
+        indexes: rawIndexes.map((index) => ({
+            name: index.name,
+            type: index.type,
+            fields: (Array.isArray(index.fields) ? index.fields : []).flatMap((field) => {
+                if (typeof field === "string") {
+                    return [field];
+                }
+                const name = recordOf(field).name;
+                return typeof name === "string" ? [name] : [];
+            }),
+            ...(index.unique === true ? { unique: true } : {}),
+            ...(index.sparse === true ? { sparse: true } : {}),
+            ...(index.type === "ttl" && typeof index.expireAfter === "number"
+                ? { expireAfter: index.expireAfter }
+                : {}),
+        })),
+        ...(verbose ? { properties, rawIndexes } : {}),
+    };
 }
 function resourceText(value, uri, maxBytes) {
     const text = JSON.stringify(value);
@@ -147,12 +212,12 @@ export function createArangoMcpServer(config, version) {
     }, {
         capabilities: { logging: {} },
         instructions: [
-            "Use listDatabases, listCollections, and describeCollection before writing AQL.",
-            "Use bindVars for values and collection names.",
-            "readQuery is enforced as read-only and returns bounded pages.",
-            "Declare collections accessed dynamically (DOCUMENT(), anonymous traversals) in a leading WITH statement.",
-            "Use continueQuery only when a result contains nextCursor.",
-            "Use sampleDocuments sparingly because database documents may contain sensitive data.",
+            "Work from metadata to data: listDatabases, then listCollections (names, types, document counts), then describeCollection or inferSchema before writing AQL.",
+            "Call listGraphs before graph traversals and listViews before SEARCH queries.",
+            "Use bindVars for values and collection names; declare collections accessed dynamically (DOCUMENT(), anonymous traversals) in a leading WITH statement.",
+            "readQuery is read-only and returns bounded pages.",
+            "Call continueQuery only with a nextCursor returned by the previous page.",
+            "Use sampleDocuments only when document contents are needed, because database documents may contain sensitive data.",
         ].join(" "),
     });
     const continuationAnnotations = config.enableReadWriteQuery
@@ -208,14 +273,19 @@ export function createArangoMcpServer(config, version) {
             .optional()
             .default(Math.min(50, config.maxRows))
             .describe(`Rows to return, capped at ${config.maxRows}`),
+        includeStats: z
+            .boolean()
+            .optional()
+            .default(false)
+            .describe("Include query statistics; a read query reports them only when the whole result fits the first page"),
     });
     server.registerTool("readQuery", {
         title: "Run read-only AQL",
-        description: "Run an AQL query in an ArangoDB read-only transaction. Data-modification plans are rejected before execution and results are size-bounded.",
+        description: "Run AQL in a read-only transaction and return a bounded page. Use bindVars for values and collection names.",
         inputSchema: queryInputSchema,
         outputSchema: queryOutputSchema,
         annotations: readOnlyAnnotations,
-    }, async ({ databaseName, aql, bindVars, pageSize }, ctx) => {
+    }, async ({ databaseName, aql, bindVars, pageSize, includeStats }, ctx) => {
         log("debug", {
             operation: "readQuery",
             databaseName,
@@ -223,11 +293,11 @@ export function createArangoMcpServer(config, version) {
             bindVariableCount: Object.keys(bindVars).length,
         });
         const page = await safely("readQuery", () => service.executeReadQuery(databaseName, aql, bindVars, pageSize, ctx.mcpReq.signal));
-        return queryPageContent(page, config.maxBytes);
+        return queryPageContent(page, config.maxBytes, { includeStats });
     });
     server.registerTool("continueQuery", {
         title: "Continue a query",
-        description: "Read the next bounded page from a stateful cursor returned by a query tool. When write-capable AQL is enabled, this also accepts readWriteQuery cursors.",
+        description: "Fetch the next bounded page for a nextCursor returned by readQuery or readWriteQuery, before the cursor expires.",
         inputSchema: z.object({
             cursor: z.string().uuid().describe("Opaque nextCursor from a previous query result"),
             pageSize: z
@@ -276,7 +346,7 @@ export function createArangoMcpServer(config, version) {
     }
     server.registerTool("listDatabases", {
         title: "List databases",
-        description: "List databases visible to both the ArangoDB user and server policy.",
+        description: "List databases allowed by server policy. Start exploration here, then call listCollections for one database.",
         inputSchema: z.object({
             cursor: z.string().max(2_048).optional().describe("Opaque cursor from a previous page"),
             limit: z
@@ -288,9 +358,8 @@ export function createArangoMcpServer(config, version) {
                 .default(Math.min(50, config.maxRows)),
         }),
         outputSchema: z.object({
-            databases: z.array(z.object({ name: z.string() })),
+            databases: z.array(z.string()),
             totalDatabases: z.number().int().nonnegative(),
-            truncated: z.boolean(),
             nextCursor: z.string().optional(),
         }),
         annotations: readOnlyAnnotations,
@@ -298,15 +367,14 @@ export function createArangoMcpServer(config, version) {
         const databases = await safely("listDatabases", () => service.listDatabases());
         const { visible, nextCursor } = paginateNames(databases, (databaseName) => databaseName, "databases", `databases:${policyFingerprint}`, cursor, limit);
         return objectContent({
-            databases: visible.map((name) => ({ name })),
+            databases: visible,
             totalDatabases: databases.length,
-            truncated: nextCursor !== undefined,
-            nextCursor,
+            ...(nextCursor === undefined ? {} : { nextCursor }),
         }, config.maxBytes);
     });
     server.registerTool("listCollections", {
         title: "List collections",
-        description: "List non-system collections in an allowed database.",
+        description: "List collection names, types, and document counts in an allowed database.",
         inputSchema: z.object({
             databaseName: z.string().min(1).describe("Database to inspect"),
             cursor: z.string().max(2_048).optional().describe("Opaque cursor from a previous page"),
@@ -322,40 +390,165 @@ export function createArangoMcpServer(config, version) {
             databaseName: z.string(),
             collections: z.array(z.object({
                 name: z.string(),
-                type: z.number().int(),
-                status: z.number().int(),
-                isSystem: z.boolean(),
+                type: z.enum(["document", "edge"]),
+                count: z.number().int().nonnegative().optional(),
             })),
             totalCollections: z.number().int().nonnegative(),
-            truncated: z.boolean(),
             nextCursor: z.string().optional(),
         }),
         annotations: readOnlyAnnotations,
     }, async ({ databaseName, cursor, limit }) => {
         const collections = await safely("listCollections", () => service.listCollections(databaseName));
         const { visible, nextCursor } = paginateNames(collections, (collection) => collection.name, "collections", `collections:${databaseName}:${policyFingerprint}`, cursor, limit);
+        const counts = visible.length
+            ? await safely("listCollections", () => service.collectionCounts(databaseName, visible.map((collection) => collection.name)))
+            : {};
         return objectContent({
             databaseName,
-            collections: visible,
+            collections: visible.map((collection) => ({
+                name: collection.name,
+                type: collection.type,
+                ...(counts[collection.name] === undefined
+                    ? {}
+                    : { count: counts[collection.name] }),
+            })),
             totalCollections: collections.length,
-            truncated: nextCursor !== undefined,
-            nextCursor,
+            ...(nextCursor === undefined ? {} : { nextCursor }),
         }, config.maxBytes);
     });
     server.registerTool("describeCollection", {
         title: "Describe a collection",
-        description: "Return collection properties, document count, optional JSON Schema, and indexes without sampling documents.",
+        description: "Describe one collection: type, document count, schema, computed values, and indexes. Set verbose for raw properties and indexes.",
         inputSchema: z.object({
             databaseName: z.string().min(1),
             collectionName: z.string().min(1),
+            verbose: z
+                .boolean()
+                .optional()
+                .default(false)
+                .describe("Also return raw collection properties and index objects"),
+        }),
+        outputSchema: describeCollectionOutputSchema,
+        annotations: readOnlyAnnotations,
+    }, async ({ databaseName, collectionName, verbose }) => {
+        const details = await safely("describeCollection", () => service.describeCollection(databaseName, collectionName));
+        return objectContent(compactCollectionDescription(details, verbose), config.maxBytes);
+    });
+    server.registerTool("inferSchema", {
+        title: "Infer a collection schema",
+        description: "Infer field paths and per-type counts from the first sampleSize documents in storage order (not a random sample). The aggregation runs entirely inside ArangoDB.",
+        inputSchema: z.object({
+            databaseName: z.string().min(1),
+            collectionName: z.string().min(1),
+            sampleSize: z
+                .number()
+                .int()
+                .min(1)
+                .max(1_000)
+                .optional()
+                .default(100)
+                .describe("Documents to scan in storage order (1-1000)"),
         }),
         outputSchema: z.object({
-            details: z.record(z.string(), z.unknown()),
+            databaseName: z.string(),
+            collectionName: z.string(),
+            sampledDocuments: z.number().int().nonnegative(),
+            fields: z.array(z.object({
+                path: z.string(),
+                types: z.record(z.string(), z.number()),
+            })),
+            truncated: z.boolean(),
         }),
         annotations: readOnlyAnnotations,
-    }, async ({ databaseName, collectionName }) => {
-        const details = await safely("describeCollection", () => service.describeCollection(databaseName, collectionName));
-        return objectContent({ details }, config.maxBytes);
+    }, async ({ databaseName, collectionName, sampleSize }, ctx) => {
+        const schema = await safely("inferSchema", () => service.inferSchema(databaseName, collectionName, sampleSize, ctx.mcpReq.signal));
+        return objectContent({ databaseName, collectionName, ...schema }, config.maxBytes);
+    });
+    server.registerTool("listGraphs", {
+        title: "List graphs",
+        description: "List named graphs with their edge definitions and orphan collections. Call it before GRAPH traversals.",
+        inputSchema: z.object({
+            databaseName: z.string().min(1).describe("Database to inspect"),
+            cursor: z.string().max(2_048).optional().describe("Opaque cursor from a previous page"),
+            limit: z
+                .number()
+                .int()
+                .min(1)
+                .max(config.maxRows)
+                .optional()
+                .default(Math.min(50, config.maxRows)),
+        }),
+        outputSchema: z.object({
+            databaseName: z.string(),
+            graphs: z.array(z.object({
+                name: z.string(),
+                edgeDefinitions: z.array(z.object({
+                    collection: z.string(),
+                    from: z.array(z.string()),
+                    to: z.array(z.string()),
+                })),
+                orphanCollections: z.array(z.string()).optional(),
+            })),
+            totalGraphs: z.number().int().nonnegative(),
+            nextCursor: z.string().optional(),
+        }),
+        annotations: readOnlyAnnotations,
+    }, async ({ databaseName, cursor, limit }) => {
+        const graphs = await safely("listGraphs", () => service.listGraphs(databaseName));
+        const { visible, nextCursor } = paginateNames(graphs, (graph) => graph.name, "graphs", `graphs:${databaseName}:${policyFingerprint}`, cursor, limit);
+        return objectContent({
+            databaseName,
+            graphs: visible,
+            totalGraphs: graphs.length,
+            ...(nextCursor === undefined ? {} : { nextCursor }),
+        }, config.maxBytes);
+    });
+    server.registerTool("listViews", {
+        title: "List views",
+        description: "List ArangoSearch and search-alias views with the collections they read and compact link definitions. Call it before SEARCH queries.",
+        inputSchema: z.object({
+            databaseName: z.string().min(1).describe("Database to inspect"),
+            cursor: z.string().max(2_048).optional().describe("Opaque cursor from a previous page"),
+            limit: z
+                .number()
+                .int()
+                .min(1)
+                .max(config.maxRows)
+                .optional()
+                .default(Math.min(50, config.maxRows)),
+        }),
+        outputSchema: z.object({
+            databaseName: z.string(),
+            views: z.array(z.discriminatedUnion("type", [
+                z.object({
+                    name: z.string(),
+                    type: z.literal("arangosearch"),
+                    collections: z.array(z.string()),
+                    links: z
+                        .record(z.string(), z.record(z.string(), z.unknown()))
+                        .optional(),
+                    primarySort: z.array(z.record(z.string(), z.unknown())).optional(),
+                }),
+                z.object({
+                    name: z.string(),
+                    type: z.literal("search-alias"),
+                    collections: z.array(z.string()),
+                    indexes: z.array(z.object({ collection: z.string(), index: z.string() })),
+                }),
+            ])),
+            totalViews: z.number().int().nonnegative(),
+            nextCursor: z.string().optional(),
+        }),
+        annotations: readOnlyAnnotations,
+    }, async ({ databaseName, cursor, limit }) => {
+        const views = await safely("listViews", () => service.listViews(databaseName));
+        const { visible, nextCursor } = paginateNames(views, (view) => view.name, "views", `views:${databaseName}:${policyFingerprint}`, cursor, limit);
+        return objectContent({
+            databaseName,
+            views: visible,
+            totalViews: views.length,
+            ...(nextCursor === undefined ? {} : { nextCursor }),
+        }, config.maxBytes);
     });
     server.registerTool("sampleDocuments", {
         title: "Sample documents",
@@ -460,16 +653,16 @@ export function createArangoMcpServer(config, version) {
     if (config.enableReadWriteQuery) {
         server.registerTool("readWriteQuery", {
             title: "Run write-capable AQL",
-            description: "Run arbitrary AQL including destructive modifications. This higher-privilege tool is exposed only when write-capable AQL is separately enabled.",
+            description: "Run arbitrary AQL, including modifications. Available only when write-capable AQL is separately enabled; writes are committed before the first page is returned.",
             inputSchema: queryInputSchema,
-            outputSchema: queryOutputSchema,
+            outputSchema: writeQueryOutputSchema,
             annotations: {
                 readOnlyHint: false,
                 destructiveHint: true,
                 idempotentHint: false,
                 openWorldHint: false,
             },
-        }, async ({ databaseName, aql, bindVars, pageSize }, ctx) => {
+        }, async ({ databaseName, aql, bindVars, pageSize, includeStats }, ctx) => {
             log("warning", {
                 operation: "readWriteQuery",
                 databaseName,
@@ -477,7 +670,10 @@ export function createArangoMcpServer(config, version) {
                 bindVariableCount: Object.keys(bindVars).length,
             });
             const page = await safely("readWriteQuery", () => service.executeWriteQuery(databaseName, aql, bindVars, pageSize, ctx.mcpReq.signal));
-            return queryPageContent(page, config.maxBytes);
+            return queryPageContent(page, config.maxBytes, {
+                includeStats,
+                includeWriteStats: true,
+            });
         });
     }
     const collectionTemplate = new ResourceTemplate("arangodb:///{database}/{collection}", {
@@ -513,7 +709,7 @@ export function createArangoMcpServer(config, version) {
     server.registerResource("ArangoDB collection metadata", collectionTemplate, {
         title: "ArangoDB collection metadata",
         mimeType: "application/json",
-        description: "Collection properties, document count, schema, and indexes",
+        description: "Compact collection type, document count, schema, and indexes",
         annotations: { audience: ["assistant"], priority: 0.7 },
     }, async (uri, variables) => {
         const databaseName = resourceSegment(variables.database);
@@ -524,7 +720,7 @@ export function createArangoMcpServer(config, version) {
                 {
                     uri: uri.href,
                     mimeType: "application/json",
-                    text: resourceText(details, uri.href, config.maxBytes),
+                    text: resourceText(compactCollectionDescription(details, false), uri.href, config.maxBytes),
                 },
             ],
         };
@@ -569,11 +765,12 @@ export function createArangoMcpServer(config, version) {
                     type: "text",
                     text: [
                         `Explore the ArangoDB database "${databaseName}" safely.`,
-                        "First list its collections, then describe only the relevant collections.",
+                        "Call listCollections for names, types, and document counts, then describeCollection or inferSchema for only the relevant collections.",
+                        "Call listGraphs before graph traversals and listViews before SEARCH queries.",
                         config.enableDiagnosticTools
                             ? "Use explainQuery before expensive AQL and use bind variables for values."
                             : "Use bind variables for values and keep AQL queries narrowly scoped.",
-                        "Keep result pages small and summarize findings without exposing unnecessary document fields.",
+                        "Summarize findings without exposing unnecessary document fields.",
                     ].join(" "),
                 },
             },

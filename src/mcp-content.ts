@@ -72,11 +72,37 @@ function jsonTextFallback(value: Record<string, unknown>): string {
   return JSON.stringify(value);
 }
 
-export function queryPageResult(page: QueryPage): ToolContentResult {
+export interface QueryPageOptions {
+  includeStats?: boolean;
+  includeWriteStats?: boolean;
+}
+
+/** The public query page: a subset of the service's internal bookkeeping. */
+function projectQueryPage(
+  page: QueryPage,
+  { includeStats = false, includeWriteStats = false }: QueryPageOptions,
+): Record<string, unknown> {
+  return {
+    rows: page.rows,
+    rowCount: page.rowCount,
+    hasMore: page.hasMore,
+    ...(page.hasMore && page.nextCursor !== undefined
+      ? { nextCursor: page.nextCursor }
+      : {}),
+    ...(page.warnings.length > 0 ? { warnings: page.warnings } : {}),
+    ...(includeStats && page.stats ? { stats: page.stats } : {}),
+    ...(includeWriteStats && page.writeStats ? page.writeStats : {}),
+  };
+}
+
+export function queryPageResult(
+  page: QueryPage,
+  options: QueryPageOptions = {},
+): ToolContentResult {
   const continuation = page.hasMore
     ? " Use nextCursor with continueQuery to fetch the next page."
     : "";
-  const structuredContent: Record<string, unknown> = { ...page };
+  const structuredContent = projectQueryPage(page, options);
   return {
     content: [
       {
@@ -89,14 +115,19 @@ export function queryPageResult(page: QueryPage): ToolContentResult {
 }
 
 export function queryPageEnvelopeBytes(page: QueryPage): number {
-  return serializedEnvelopeBytes(queryPageResult(page));
+  // Measure the superset the public projection can expose, so the service's
+  // envelope bookkeeping stays a valid upper bound.
+  return serializedEnvelopeBytes(
+    queryPageResult(page, { includeStats: true, includeWriteStats: true }),
+  );
 }
 
 export function boundedQueryPageResult(
   page: QueryPage,
   maxBytes: number,
+  options: QueryPageOptions = {},
 ): ToolContentResult {
-  const result = queryPageResult(page);
+  const result = queryPageResult(page, options);
   const bytes = serializedEnvelopeBytes(result);
   if (bytes > maxBytes) {
     throw new Error(

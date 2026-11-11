@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { Client } from "@modelcontextprotocol/client";
@@ -29,25 +30,24 @@ test("advertises the minimal structured tool profile by default", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name);
 
-    assert.ok(names.includes("readQuery"));
-    assert.ok(names.includes("continueQuery"));
-    assert.ok(names.includes("describeCollection"));
-    assert.ok(names.includes("sampleDocuments"));
-    assert.ok(!names.includes("explainQuery"));
-    assert.ok(!names.includes("healthCheck"));
-    assert.ok(!names.includes("readWriteQuery"));
-    assert.equal(names.length, 6);
+    assert.deepEqual(names.sort(), [
+      "continueQuery",
+      "describeCollection",
+      "inferSchema",
+      "listCollections",
+      "listDatabases",
+      "listGraphs",
+      "listViews",
+      "readQuery",
+      "sampleDocuments",
+    ]);
 
     for (const tool of tools) {
       assert.equal(tool.outputSchema?.type, "object", `${tool.name} has outputSchema`);
       assert.equal(tool.annotations?.openWorldHint, false);
+      assert.equal(tool.annotations?.readOnlyHint, true, `${tool.name} is read-only`);
     }
-    assert.equal(
-      tools.find((tool) => tool.name === "readQuery")?.annotations?.readOnlyHint,
-      true,
-    );
     const continueQuery = tools.find((tool) => tool.name === "continueQuery");
-    assert.equal(continueQuery?.annotations?.readOnlyHint, true);
     assert.equal(continueQuery?.annotations?.idempotentHint, false);
 
     const { resourceTemplates } = await client.listResourceTemplates();
@@ -61,7 +61,10 @@ test("advertises the minimal structured tool profile by default", async () => {
 
     const { prompts } = await client.listPrompts();
     assert.ok(prompts.some((prompt) => prompt.name === "exploreDatabase"));
-    assert.equal(client.getServerVersion()?.version, "2.0.0");
+    assert.equal(
+      client.getServerVersion()?.version,
+      JSON.parse(readFileSync("package.json", "utf8")).version,
+    );
   } finally {
     await client.close();
   }
@@ -139,7 +142,7 @@ test("adds diagnostic tools only when explicitly enabled", async () => {
     const names = tools.map((tool) => tool.name);
     assert.ok(names.includes("explainQuery"));
     assert.ok(names.includes("healthCheck"));
-    assert.equal(names.length, 8);
+    assert.equal(names.length, 11);
   } finally {
     await client.close();
   }
