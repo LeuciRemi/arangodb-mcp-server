@@ -185,7 +185,7 @@ npm run dev:setup
 npm run dev
 ```
 
-The packaged server and the MCP Inspector 2 used by `npm run dev` both require Node.js 22.19 or newer. Inspector 2 does not forward the parent shell environment to the server, so `nodemon.json` passes the disposable development credentials with `-e`; Inspector 2 may persist such `-e` values in the OS keychain or `~/.mcp-inspector/`, so never point it at real credentials this way.
+`npm run dev` builds the server, keeps `tsc --watch` running, and opens MCP Inspector 2; reconnect in the Inspector to pick up a rebuild. The packaged server and Inspector 2 both require Node.js 22.19 or newer. Inspector 2 does not forward the parent shell environment to the server, so `dev/dev.mjs` passes the disposable development credentials with `-e`; Inspector 2 may persist such `-e` values in the OS keychain or `~/.mcp-inspector/`, so never point it at real credentials this way.
 
 The generated demo contains `ecommerce_db` and `library_db`. Tear it down with:
 

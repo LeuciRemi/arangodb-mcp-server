@@ -39,7 +39,7 @@
     "docker:remove": "docker rm arangodb-for-arangodb-mcp-server-dev",
     "dev:setup": "npm run generate-data && npm run docker:build && npm run docker:run",
     "dev:teardown": "npm run docker:stop && npm run docker:remove",
-    "dev": "nodemon",
+    "dev": "node dev/dev.mjs",
     "build": "npm run clean && tsc && shx chmod +x dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "npm run test:unit",
@@ -58,7 +58,6 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "^2.3.1",
-    "nodemon": "^3.1.14",
     "shx": "^0.4.0",
     "typescript": "^7.0.2"
   }

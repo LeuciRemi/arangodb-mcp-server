@@ -4,6 +4,7 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Update the MCP SDK to 2.4.0 and Undici to 8.12.4. Replace nodemon with a `tsc --watch` development loop (`dev/dev.mjs`), which removes the last development-only npm audit advisories.
 - List databases through `/_api/database/user` and report health from a visible database, so a least-privilege user without access to `_system` can list databases, run `healthCheck`, and query its own database.
 - Ignore allowlist entries for collections that do not exist instead of declaring them in the transaction, so one stale entry no longer fails every query in that database.
 - Allow querying ArangoSearch and `search-alias` views: views are authorised through their linked collections, excluded from transaction declarations and `explainQuery` collections, and reported separately as `views`.
@@ -14,7 +15,7 @@ All notable changes to this project are documented here.
 - **Breaking:** require Node.js 22.19 or newer (Undici 8 and MCP Inspector 2 minimum; Node.js 20 is end-of-life). CI now tests Node.js 22, 24 and 26 and runs integration on Node.js 24 LTS.
 - Migrate from `@modelcontextprotocol/sdk` 1.32 to the MCP TypeScript SDK v2 (`@modelcontextprotocol/server` 2.3.1; `@modelcontextprotocol/client` 2.3.1 for tests): tool and prompt schemas are now Zod object schemas, `McpError` becomes `ProtocolError`, and handlers read cancellation from `ctx.mcpReq.signal`.
 - SDK v2 reports unknown tools as JSON-RPC errors (`-32602`) instead of `isError` tool results; the transport boundary now also redacts and size-bounds JSON-RPC error responses, dropping oversized error data first.
-- Update Undici to 8.12.3 and keep arangojs 10.6.0, Zod 4.6.7, TypeScript 7.0.2, nodemon 3.1.14 and shx 0.4.0 (already the latest majors). Drop the `@hono/node-server` and `fast-uri` overrides, which only applied to SDK v1 transitive dependencies.
+- Update Undici to 8.12.3 and keep arangojs 10.6.0, Zod 4.6.7, TypeScript 7.0.2 and shx 0.4.0 (already the latest majors). Drop the `@hono/node-server` and `fast-uri` overrides, which only applied to SDK v1 transitive dependencies.
 - Update the development MCP Inspector to 2.12.0, passing its server environment with `-e`; update GitHub Actions to `actions/checkout@v7` and `actions/setup-node@v7`, and pin `shell.nix` to `nodejs_24`.
 
 - Validate document selectors before HTTP requests to prevent collection-policy bypasses through path traversal.
@@ -26,7 +27,7 @@ All notable changes to this project are documented here.
 - Update MCP SDK to 1.32.1, arangojs to 10.6.0, Undici to 6.29.1 and Zod to 4.6.7; refresh compatible transitives, including proxy-addr 2.0.8.
 - Pin the disposable development/integration database to ArangoDB 3.12.12 and run CI for develop pushes.
 - Keep the oversized SDK validation-error regression effective when array-length checks short-circuit per-item validation; preserve the byte limit, truncation and no-callback assertions.
-- Production-only npm audit is clean for this update. The development-only braces advisory remains through nodemon/shx; no forced downgrade or audit suppression is applied.
+- Production-only npm audit is clean for this update.
 
 ## 2.0.0
 
