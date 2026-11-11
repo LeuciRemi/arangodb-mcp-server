@@ -120,3 +120,29 @@ test("rejects invalid policies, protocols, and flags", () => {
 test("reports help without terminating the process", () => {
   assert.throws(() => parseConfig(["--help"], {}), HelpRequested);
 });
+
+test("derives the default request timeout from the maximum runtime", () => {
+  const slowerRuntime = parseConfig([], {
+    ARANGO_URL: "http://localhost:8529",
+    ARANGO_MCP_MAX_RUNTIME: "120",
+  });
+  assert.equal(slowerRuntime.requestTimeoutMs, 125_000);
+
+  const defaults = parseConfig([], { ARANGO_URL: "http://localhost:8529" });
+  assert.equal(defaults.requestTimeoutMs, 35_000);
+});
+
+test("keeps an explicit request timeout independent of the maximum runtime", () => {
+  const fromEnvironment = parseConfig([], {
+    ARANGO_URL: "http://localhost:8529",
+    ARANGO_MCP_MAX_RUNTIME: "120",
+    ARANGO_MCP_REQUEST_TIMEOUT: "4000",
+  });
+  assert.equal(fromEnvironment.requestTimeoutMs, 4_000);
+
+  const fromCli = parseConfig(
+    ["--max-runtime=600", "--request-timeout=9000", "http://localhost:8529"],
+    {},
+  );
+  assert.equal(fromCli.requestTimeoutMs, 9_000);
+});

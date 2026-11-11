@@ -12,6 +12,7 @@ const password = process.env.ARANGO_TEST_PASSWORD ?? "test";
 function createClient(
   collectionNames,
   {
+    database = "_system",
     documentWrites = false,
     readWriteQuery = false,
     limits = {},
@@ -21,7 +22,7 @@ function createClient(
   const allowedCollections = (Array.isArray(collectionNames)
     ? collectionNames
     : [collectionNames]
-  ).map((collectionName) => `_system/${collectionName}`);
+  ).map((collectionName) => `${database}/${collectionName}`);
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: ["dist/index.js"],
@@ -30,7 +31,7 @@ function createClient(
       ARANGO_URL: url,
       ARANGO_USERNAME: credentials.username,
       ARANGO_PASSWORD: credentials.password,
-      ARANGO_ALLOWED_DATABASES: "_system",
+      ARANGO_ALLOWED_DATABASES: database,
       ARANGO_ALLOWED_COLLECTIONS: allowedCollections.join(","),
       ARANGO_MCP_MAX_ROWS: String(limits.maxRows ?? 2),
       ARANGO_MCP_MAX_BYTES: String(limits.maxBytes ?? 65536),
@@ -51,6 +52,25 @@ function createClient(
     ),
     transport,
   };
+}
+
+async function waitForViewDocuments(database, viewName, expectedCount, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    // waitForSync is rejected inside the server's stream transactions, but it
+    // is valid on this administrative connection outside a transaction.
+    const cursor = await database.query(
+      `FOR doc IN ${viewName} OPTIONS { waitForSync: true } COLLECT WITH COUNT INTO count RETURN count`,
+    );
+    const [count] = await cursor.all();
+    if (count === expectedCount) {
+      return;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`View ${viewName} indexed ${count} of ${expectedCount} documents`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
 test(
@@ -828,6 +848,181 @@ test(
     } finally {
       await client.close();
       await collection.drop().catch(() => undefined);
+      admin.close();
+    }
+  },
+);
+
+test(
+  "serves a least-privilege user that has no access to _system",
+  { skip: !url, timeout: 60_000 },
+  async () => {
+    const admin = new Database({
+      url,
+      databaseName: "_system",
+      auth: { username, password },
+    });
+    const suffix = `${Date.now()}`;
+    const databaseName = `mcp_lowpriv_${suffix}`;
+    const collectionName = "documents";
+    const readerName = `mcp_lowpriv_reader_${suffix}`;
+    const readerPassword = `reader-${suffix}`;
+    const { client, transport } = createClient(collectionName, {
+      database: databaseName,
+      credentials: { username: readerName, password: readerPassword },
+    });
+    let database;
+    try {
+      database = await admin.createDatabase(databaseName);
+      const collection = database.collection(collectionName);
+      await collection.create();
+      await collection.save({ _key: "visible", value: 1 });
+      await admin.createUser(readerName, readerPassword);
+      await admin.setUserAccessLevel(readerName, { database: databaseName }, "ro");
+      await admin.setUserAccessLevel(readerName, { database: "_system" }, "none");
+
+      await client.connect(transport);
+
+      const databases = await client.callTool({ name: "listDatabases", arguments: {} });
+      assert.notEqual(databases.isError, true, JSON.stringify(databases.content));
+      assert.deepEqual(
+        databases.structuredContent.databases.map(({ name }) => name),
+        [databaseName],
+      );
+
+      const health = await client.callTool({ name: "healthCheck", arguments: {} });
+      assert.notEqual(health.isError, true, JSON.stringify(health.content));
+      assert.equal(health.structuredContent.health.status, "ok");
+      assert.match(health.structuredContent.health.arangoVersion, /^\d+\.\d+/);
+
+      const read = await client.callTool({
+        name: "readQuery",
+        arguments: {
+          databaseName,
+          aql: "FOR doc IN @@collection RETURN doc._key",
+          bindVars: { "@collection": collectionName },
+        },
+      });
+      assert.notEqual(read.isError, true, JSON.stringify(read.content));
+      assert.deepEqual(read.structuredContent.rows, ["visible"]);
+    } finally {
+      await client.close().catch(() => undefined);
+      await admin.removeUser(readerName).catch(() => undefined);
+      database?.close();
+      await admin.dropDatabase(databaseName).catch(() => undefined);
+      admin.close();
+    }
+  },
+);
+
+test(
+  "ignores allowlist entries for collections that do not exist",
+  { skip: !url, timeout: 60_000 },
+  async () => {
+    const admin = new Database({
+      url,
+      databaseName: "_system",
+      auth: { username, password },
+    });
+    const suffix = `${Date.now()}`;
+    const collectionName = `mcp_stale_${suffix}`;
+    const ghostName = `${collectionName}_ghost`;
+    const collection = admin.collection(collectionName);
+    await collection.create();
+    await collection.save({ _key: "kept", value: 1 });
+
+    const { client, transport } = createClient([collectionName, ghostName]);
+    try {
+      await client.connect(transport);
+      const result = await client.callTool({
+        name: "readQuery",
+        arguments: {
+          databaseName: "_system",
+          aql: "FOR doc IN @@collection RETURN doc._key",
+          bindVars: { "@collection": collectionName },
+        },
+      });
+      assert.notEqual(result.isError, true, JSON.stringify(result.content));
+      assert.deepEqual(result.structuredContent.rows, ["kept"]);
+    } finally {
+      await client.close().catch(() => undefined);
+      await collection.drop().catch(() => undefined);
+      admin.close();
+    }
+  },
+);
+
+test(
+  "queries ArangoSearch views through their linked collections",
+  { skip: !url, timeout: 90_000 },
+  async () => {
+    const admin = new Database({
+      url,
+      databaseName: "_system",
+      auth: { username, password },
+    });
+    const suffix = `${Date.now()}`;
+    const firstCollection = `mcp_view_first_${suffix}`;
+    const secondCollection = `mcp_view_second_${suffix}`;
+    const viewName = `mcp_view_${suffix}`;
+    const aql = `FOR doc IN ${viewName} SORT doc._key RETURN doc._key`;
+    const allowedClient = createClient([firstCollection, secondCollection], {
+      limits: { maxRows: 10 },
+    });
+    const partialClient = createClient([firstCollection], { limits: { maxRows: 10 } });
+    try {
+      await admin.collection(firstCollection).create();
+      await admin.collection(secondCollection).create();
+      await admin.collection(firstCollection).save([
+        { _key: "a", value: 1 },
+        { _key: "b", value: 2 },
+      ]);
+      await admin.collection(secondCollection).save({ _key: "c", value: 3 });
+      await admin.createView(viewName, {
+        type: "arangosearch",
+        links: {
+          [firstCollection]: { includeAllFields: true },
+          [secondCollection]: { includeAllFields: true },
+        },
+      });
+      await waitForViewDocuments(admin, viewName, 3);
+
+      await allowedClient.client.connect(allowedClient.transport);
+      const result = await allowedClient.client.callTool({
+        name: "readQuery",
+        arguments: { databaseName: "_system", aql },
+      });
+      assert.notEqual(result.isError, true, JSON.stringify(result.content));
+      assert.deepEqual(result.structuredContent.rows, ["a", "b", "c"]);
+
+      const explanation = await allowedClient.client.callTool({
+        name: "explainQuery",
+        arguments: { databaseName: "_system", aql },
+      });
+      assert.notEqual(explanation.isError, true, JSON.stringify(explanation.content));
+      assert.deepEqual(explanation.structuredContent.views, [viewName]);
+      assert.deepEqual(
+        explanation.structuredContent.collections.map(({ name }) => name).sort(),
+        [firstCollection, secondCollection].sort(),
+      );
+
+      await partialClient.client.connect(partialClient.transport);
+      const rejected = await partialClient.client.callTool({
+        name: "readQuery",
+        arguments: { databaseName: "_system", aql },
+      });
+      assert.equal(rejected.isError, true);
+      assert.match(rejected.content[0].text, /is not allowed by server policy/);
+      assert.match(rejected.content[0].text, new RegExp(secondCollection));
+    } finally {
+      await allowedClient.client.close().catch(() => undefined);
+      await partialClient.client.close().catch(() => undefined);
+      await admin.view(viewName).drop().catch(() => undefined);
+      await Promise.all(
+        [firstCollection, secondCollection].map((name) =>
+          admin.collection(name).drop().catch(() => undefined)
+        ),
+      );
       admin.close();
     }
   },

@@ -53,7 +53,7 @@ export const USAGE = [
   "  --max-write-spool-bytes=<number>  Hard byte limit for buffered write-query results",
   "  --max-runtime=<seconds>           ArangoDB query runtime limit",
   "  --memory-limit=<bytes>            ArangoDB query memory limit",
-  "  --request-timeout=<milliseconds>  Client-side request timeout",
+  "  --request-timeout=<milliseconds>  Client-side request timeout (default: max runtime + 5 s)",
   "  --cursor-ttl=<seconds>            Continuation cursor lifetime",
   "  --help                            Show this help",
 ].join("\n");
@@ -64,7 +64,7 @@ const DEFAULTS = {
   maxWriteSpoolBytes: 16 * 1024 * 1024,
   maxRuntimeSeconds: 30,
   memoryLimitBytes: 128 * 1024 * 1024,
-  requestTimeoutMs: 35_000,
+  requestTimeoutMarginMs: 5_000,
   cursorTtlSeconds: 30,
   maxActiveCursors: 32,
 };
@@ -225,6 +225,12 @@ export function parseConfig(
     }
   }
 
+  const maxRuntimeSeconds = parsePositiveInteger(
+    numericFlags.get("--max-runtime") ?? env.ARANGO_MCP_MAX_RUNTIME,
+    DEFAULTS.maxRuntimeSeconds,
+    "max runtime",
+  );
+
   return {
     databaseUrl: validateUrl(databaseUrl),
     username,
@@ -272,19 +278,18 @@ export function parseConfig(
       "max write spool bytes",
       1_024,
     ),
-    maxRuntimeSeconds: parsePositiveInteger(
-      numericFlags.get("--max-runtime") ?? env.ARANGO_MCP_MAX_RUNTIME,
-      DEFAULTS.maxRuntimeSeconds,
-      "max runtime",
-    ),
+    maxRuntimeSeconds,
     memoryLimitBytes: parsePositiveInteger(
       numericFlags.get("--memory-limit") ?? env.ARANGO_MCP_MEMORY_LIMIT,
       DEFAULTS.memoryLimitBytes,
       "memory limit",
     ),
+    // The client must outwait the server-side runtime limit; otherwise a long
+    // query fails with an opaque client timeout while it keeps running.
     requestTimeoutMs: parsePositiveInteger(
       numericFlags.get("--request-timeout") ?? env.ARANGO_MCP_REQUEST_TIMEOUT,
-      DEFAULTS.requestTimeoutMs,
+      // Node.js timers silently turn delays above 2^31 - 1 ms into 1 ms.
+      Math.min(maxRuntimeSeconds * 1_000 + DEFAULTS.requestTimeoutMarginMs, 2_147_483_647),
       "request timeout",
       100,
     ),

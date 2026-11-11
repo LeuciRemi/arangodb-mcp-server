@@ -35,7 +35,7 @@ export function redactErrorMessage(value, config) {
     catch {
         // Configuration already validates the URL. Keep error handling defensive.
     }
-    return redacted.replace(/https?:\/\/[^\s/@:]+:[^\s/@]+@/g, "https://[redacted]@");
+    return redacted.replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/g, "$1[redacted]@");
 }
 export function publicErrorMessage(error, config) {
     if (error instanceof UserFacingError) {
@@ -48,5 +48,9 @@ export function publicErrorMessage(error, config) {
             ? `ArangoDB request failed (${fields.code})`
             : "ArangoDB request failed";
     const detail = fields.message ? `: ${fields.message}` : "";
-    return redactErrorMessage(`${prefix}${detail}`, config);
+    // Error 1652: a collection reached only at runtime is not part of the plan.
+    const hint = fields.errorNum === 1652
+        ? ". Declare collections that are accessed dynamically (DOCUMENT(), anonymous traversals) in a leading WITH statement"
+        : "";
+    return redactErrorMessage(`${prefix}${detail}${hint}`, config);
 }

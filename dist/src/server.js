@@ -150,6 +150,7 @@ export function createArangoMcpServer(config, version) {
             "Use listDatabases, listCollections, and describeCollection before writing AQL.",
             "Use bindVars for values and collection names.",
             "readQuery is enforced as read-only and returns bounded pages.",
+            "Declare collections accessed dynamically (DOCUMENT(), anonymous traversals) in a leading WITH statement.",
             "Use continueQuery only when a result contains nextCursor.",
             "Use sampleDocuments sparingly because database documents may contain sensitive data.",
         ].join(" "),
@@ -258,6 +259,7 @@ export function createArangoMcpServer(config, version) {
                 estimatedCost: z.number(),
                 estimatedNrItems: z.number(),
                 collections: z.array(z.object({ name: z.string(), type: z.enum(["read", "write"]) })),
+                views: z.array(z.string()),
                 rules: z.array(z.string()),
                 nodes: z.array(z.object({
                     type: z.string(),

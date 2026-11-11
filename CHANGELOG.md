@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- List databases through `/_api/database/user` and report health from a visible database, so a least-privilege user without access to `_system` can list databases, run `healthCheck`, and query its own database.
+- Ignore allowlist entries for collections that do not exist instead of declaring them in the transaction, so one stale entry no longer fails every query in that database.
+- Allow querying ArangoSearch and `search-alias` views: views are authorised through their linked collections, excluded from transaction declarations and `explainQuery` collections, and reported separately as `views`.
+- Stop sending `returnNew`/`returnOld` for document CRUD because the returned documents were discarded.
+- Append a leading `WITH` hint to ArangoDB error 1652 and state the requirement in the server instructions.
+- Preserve the original URL scheme when redacting credentials from error messages.
+- Derive the default request timeout from `ARANGO_MCP_MAX_RUNTIME` plus 5000 ms instead of a fixed 35000 ms; an explicit `ARANGO_MCP_REQUEST_TIMEOUT` or `--request-timeout` still takes precedence.
 - **Breaking:** require Node.js 22.19 or newer (Undici 8 and MCP Inspector 2 minimum; Node.js 20 is end-of-life). CI now tests Node.js 22, 24 and 26 and runs integration on Node.js 24 LTS.
 - Migrate from `@modelcontextprotocol/sdk` 1.32 to the MCP TypeScript SDK v2 (`@modelcontextprotocol/server` 2.3.1; `@modelcontextprotocol/client` 2.3.1 for tests): tool and prompt schemas are now Zod object schemas, `McpError` becomes `ProtocolError`, and handlers read cancellation from `ctx.mcpReq.signal`.
 - SDK v2 reports unknown tools as JSON-RPC errors (`-32602`) instead of `isError` tool results; the transport boundary now also redacts and size-bounds JSON-RPC error responses, dropping oversized error data first.

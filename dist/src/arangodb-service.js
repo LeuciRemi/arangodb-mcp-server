@@ -9,6 +9,18 @@ import { queryPageEnvelopeBytes } from "./mcp-content.js";
 function unique(values) {
     return [...new Set(values)];
 }
+/**
+ * A plan lists views among its collections, but a view cannot be declared in a
+ * transaction. The collections a view reads are listed as well, so they alone
+ * carry the allowlist check and the transaction declaration.
+ */
+function splitPlannedViews(plan) {
+    const views = unique(plan.nodes.flatMap((node) => node.type === "EnumerateViewNode" && typeof node.view === "string" ? [node.view] : []));
+    return {
+        collections: plan.collections.filter((collection) => !views.includes(collection.name)),
+        views,
+    };
+}
 function asRecord(value) {
     return value && typeof value === "object" ? value : {};
 }
@@ -101,14 +113,18 @@ export class ArangoDBService {
             this.assertCollectionAllowed(databaseName, collectionName);
         }
     }
-    declaredReadCollections(databaseName, plannedCollections) {
+    async declaredReadCollections(database, databaseName, plannedCollections) {
         if (this.config.allowedCollections.size === 0) {
             return unique(plannedCollections);
         }
+        // Declaring a collection that does not exist fails the whole transaction,
+        // so a stale allowlist entry must not be declared.
+        const existing = new Set((await database.listCollections(false)).map((collection) => collection.name));
         const prefix = `${databaseName}/`;
         return [...this.config.allowedCollections]
             .filter((entry) => entry.startsWith(prefix))
-            .map((entry) => entry.slice(prefix.length));
+            .map((entry) => entry.slice(prefix.length))
+            .filter((collectionName) => existing.has(collectionName));
     }
     getDatabase(databaseName) {
         this.assertOpen();
@@ -134,9 +150,9 @@ export class ArangoDBService {
     }
     async listDatabases() {
         this.assertOpen();
-        const databases = await this.rootDatabase.databases();
+        // Unlike /_api/database, this endpoint does not require access to _system.
+        const databases = await this.rootDatabase.listUserDatabases();
         return databases
-            .map((database) => database.name)
             .filter((databaseName) => this.config.allowedDatabases.size === 0 ||
             this.config.allowedDatabases.has(databaseName))
             .sort();
@@ -208,7 +224,7 @@ export class ArangoDBService {
         }
         const result = await this.getDatabase(databaseName)
             .collection(collectionName)
-            .save(document, { returnNew: true });
+            .save(document);
         return operationMetadata(result);
     }
     async updateDocument(databaseName, collectionName, documentId, revision, patch) {
@@ -221,7 +237,7 @@ export class ArangoDBService {
         }
         const result = await this.getDatabase(databaseName)
             .collection(collectionName)
-            .update(key, patch, { ifMatch: revision, returnNew: true });
+            .update(key, patch, { ifMatch: revision });
         return operationMetadata(result);
     }
     async deleteDocument(databaseName, collectionName, documentId, revision) {
@@ -230,7 +246,7 @@ export class ArangoDBService {
         const key = this.documentKey(collectionName, documentId);
         const result = await this.getDatabase(databaseName)
             .collection(collectionName)
-            .remove(key, { ifMatch: revision, returnOld: true });
+            .remove(key, { ifMatch: revision });
         return operationMetadata(result);
     }
     validateQueryInput(query, bindVars) {
@@ -255,14 +271,15 @@ export class ArangoDBService {
         if (plan.isModificationQuery || plan.collections.some((item) => item.type === "write")) {
             throw new UserFacingError("readQuery rejected a data-modification query; use readWriteQuery only when writes are explicitly enabled");
         }
-        const collectionNames = unique(plan.collections.map((collection) => collection.name));
-        this.assertCollectionsAllowed(databaseName, collectionNames);
+        const { collections, views } = splitPlannedViews(plan);
+        this.assertCollectionsAllowed(databaseName, unique(collections.map((collection) => collection.name)));
         return {
             databaseName,
             isModificationQuery: plan.isModificationQuery,
             estimatedCost: plan.estimatedCost,
             estimatedNrItems: plan.estimatedNrItems,
-            collections: plan.collections,
+            collections,
+            views,
             rules: plan.rules,
             nodes: plan.nodes.map((node) => ({
                 type: node.type,
@@ -306,7 +323,7 @@ export class ArangoDBService {
             const plan = await this.getReadOnlyPlan(databaseName, query, bindVars);
             this.assertQueryActive(signal);
             const database = this.getDatabase(databaseName);
-            const readCollections = this.declaredReadCollections(databaseName, plan.collections.map((collection) => collection.name));
+            const readCollections = await this.declaredReadCollections(database, databaseName, plan.collections.map((collection) => collection.name));
             const transactionOptions = {
                 allowImplicit: false,
                 // ArangoDB supports this stream-transaction option even though arangojs
@@ -359,14 +376,14 @@ export class ArangoDBService {
                 maxNumberOfPlans: 1,
             });
             this.assertQueryActive(signal);
-            const plannedCollections = explanation.plan.collections;
+            const plannedCollections = splitPlannedViews(explanation.plan).collections;
             this.assertCollectionsAllowed(databaseName, unique(plannedCollections.map((collection) => collection.name)));
             const writeCollections = unique(plannedCollections
                 .filter((collection) => collection.type === "write")
                 .map((collection) => collection.name));
-            const readCollections = this.declaredReadCollections(databaseName, plannedCollections
+            const readCollections = (await this.declaredReadCollections(database, databaseName, plannedCollections
                 .filter((collection) => collection.type === "read")
-                .map((collection) => collection.name)).filter((collectionName) => !writeCollections.includes(collectionName));
+                .map((collection) => collection.name))).filter((collectionName) => !writeCollections.includes(collectionName));
             const transactionOptions = {
                 allowImplicit: false,
                 // See the corresponding read transaction note above.
@@ -674,15 +691,18 @@ export class ArangoDBService {
     }
     async health() {
         this.assertOpen();
-        const [version, availability] = await Promise.all([
-            this.rootDatabase.version(true),
+        const [databases, availability] = await Promise.all([
+            this.listDatabases(),
             this.rootDatabase.availability(true),
         ]);
+        // /_api/version requires access to the addressed database, and a
+        // least-privilege user usually has none on _system.
+        const version = databases.length > 0 ? await this.getDatabase(databases[0]).version() : undefined;
         return {
             status: availability === false ? "unavailable" : "ok",
             availability,
-            arangoVersion: version.version,
-            server: version.server,
+            arangoVersion: version?.version,
+            server: version?.server,
             documentWritesEnabled: this.config.enableDocumentWrites,
             readWriteQueryEnabled: this.config.enableReadWriteQuery,
             diagnosticToolsEnabled: this.config.enableDiagnosticTools,

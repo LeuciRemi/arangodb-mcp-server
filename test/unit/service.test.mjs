@@ -12,12 +12,22 @@ function deferred() {
   return { promise, resolve };
 }
 
-function createService(t, { rows = [1, 2, 3], limits = {}, hooks = {} } = {}) {
+function createService(
+  t,
+  {
+    rows = [1, 2, 3],
+    limits = {},
+    hooks = {},
+    plan,
+    existingCollections = ["public"],
+    allowedCollections = "test/public",
+  } = {},
+) {
   const config = {
     ...parseConfig([], {
       ARANGO_URL: "http://127.0.0.1:1",
       ARANGO_ALLOWED_DATABASES: "test",
-      ARANGO_ALLOWED_COLLECTIONS: "test/public",
+      ARANGO_ALLOWED_COLLECTIONS: allowedCollections,
       ARANGO_ENABLE_DOCUMENT_WRITES: "true",
       ARANGO_ENABLE_READ_WRITE_QUERY: "true",
     }),
@@ -27,6 +37,8 @@ function createService(t, { rows = [1, 2, 3], limits = {}, hooks = {} } = {}) {
   const events = [];
   const selectors = [];
   const spoolPaths = [];
+  const transactions = [];
+  const listCollectionCalls = [];
   const removeSpool = service.removeSpool.bind(service);
   service.removeSpool = async (spool) => {
     spoolPaths.push(spool.path);
@@ -48,7 +60,7 @@ function createService(t, { rows = [1, 2, 3], limits = {}, hooks = {} } = {}) {
       events.push("explain");
       await hooks.explain?.();
       return {
-        plan: {
+        plan: plan ?? {
           collections: [{ name: "public", type: "read" }],
           isModificationQuery: false,
           estimatedCost: 1,
@@ -59,8 +71,14 @@ function createService(t, { rows = [1, 2, 3], limits = {}, hooks = {} } = {}) {
         warnings: [],
       };
     },
-    async beginTransaction() {
+    async listCollections(includeSystem) {
+      listCollectionCalls.push(includeSystem);
+      await hooks.listCollections?.();
+      return existingCollections.map((name) => ({ name }));
+    },
+    async beginTransaction(readWrite, options) {
       events.push("begin");
+      transactions.push({ readWrite, options });
       await hooks.begin?.();
       return transaction;
     },
@@ -100,7 +118,15 @@ function createService(t, { rows = [1, 2, 3], limits = {}, hooks = {} } = {}) {
       await assert.rejects(access(path), { code: "ENOENT" });
     }
   });
-  return { service, config, events, selectors, spoolPaths };
+  return {
+    service,
+    config,
+    events,
+    selectors,
+    spoolPaths,
+    transactions,
+    listCollectionCalls,
+  };
 }
 
 test("rejects unsafe document selectors before accessing a collection", async (t) => {
@@ -299,4 +325,81 @@ test("shutdown waits for an active continuation to abort before closing connecti
   await closing;
   assert.ok(events.indexOf("abort") < events.indexOf("close"));
   assert.equal(events.filter((event) => event === "close").length, 1);
+});
+
+test("declares only existing allowlisted collections in the read transaction", async (t) => {
+  const { service, transactions, listCollectionCalls } = createService(t, {
+    allowedCollections: "test/public,test/ghost",
+  });
+  const page = await service.executeReadQuery("test", "RETURN 1", {}, 3);
+  assert.deepEqual(page.rows, [1, 2, 3]);
+  assert.deepEqual(
+    listCollectionCalls,
+    [false],
+    "system collections are included so allowlisted system collections stay declared",
+  );
+  assert.deepEqual(transactions.map(({ readWrite }) => readWrite), [{ read: ["public"] }]);
+  assert.deepEqual(transactions.map(({ options }) => options.allowImplicit), [false]);
+});
+
+test("authorises views through their linked collections, not their names", async (t) => {
+  const plan = {
+    collections: [
+      { name: "public", type: "read" },
+      { name: "linked", type: "read" },
+      { name: "search_view", type: "read" },
+    ],
+    isModificationQuery: false,
+    estimatedCost: 1,
+    estimatedNrItems: 2,
+    nodes: [
+      { type: "SingletonNode", estimatedCost: 1, estimatedNrItems: 1 },
+      { type: "EnumerateViewNode", view: "search_view", estimatedCost: 1, estimatedNrItems: 2 },
+    ],
+    rules: [],
+  };
+  const { service, transactions } = createService(t, {
+    rows: ["a", "b"],
+    plan,
+    existingCollections: ["public", "linked"],
+    allowedCollections: "test/public,test/linked",
+  });
+  const aql = "FOR doc IN search_view RETURN doc._key";
+
+  const explanation = await service.explainReadQuery("test", aql, {});
+  assert.deepEqual(explanation.views, ["search_view"]);
+  assert.deepEqual(explanation.collections, [
+    { name: "public", type: "read" },
+    { name: "linked", type: "read" },
+  ]);
+
+  const page = await service.executeReadQuery("test", aql, {}, 2);
+  assert.deepEqual(page.rows, ["a", "b"]);
+  assert.deepEqual(transactions.map(({ readWrite }) => readWrite), [
+    { read: ["public", "linked"] },
+  ]);
+  assert.deepEqual(transactions.map(({ options }) => options.allowImplicit), [false]);
+});
+
+test("rejects a view whose linked collections are not all allowlisted", async (t) => {
+  const plan = {
+    collections: [
+      { name: "public", type: "read" },
+      { name: "hidden", type: "read" },
+      { name: "search_view", type: "read" },
+    ],
+    isModificationQuery: false,
+    estimatedCost: 1,
+    estimatedNrItems: 2,
+    nodes: [
+      { type: "EnumerateViewNode", view: "search_view", estimatedCost: 1, estimatedNrItems: 2 },
+    ],
+    rules: [],
+  };
+  const { service, transactions } = createService(t, { plan });
+  await assert.rejects(
+    service.executeReadQuery("test", "FOR doc IN search_view RETURN doc._key", {}, 1),
+    /Collection "test\/hidden" is not allowed by server policy/,
+  );
+  assert.deepEqual(transactions, [], "a rejected view query must not open a transaction");
 });

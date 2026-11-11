@@ -9,6 +9,9 @@ The server is schema-first and read-only by default. It supports multiple databa
 - `readQuery` is executed inside an ArangoDB transaction with no write collections and `allowImplicit: false`.
 - ArangoDB's optimizer plan is checked before execution; modification queries are rejected.
 - Allowed collections are explicitly declared to transactions, so dynamic reads cannot escape the configured allowlist.
+- Collections reached only at runtime (`DOCUMENT()`, anonymous graph traversals) are absent from the optimizer plan; declare them in a leading `WITH` statement, otherwise ArangoDB fails with error 1652.
+- Allowlist entries for collections that do not exist are ignored instead of being declared, so a stale entry cannot fail every query in that database.
+- ArangoSearch (`arangosearch`) and `search-alias` views are queryable. A view is authorised through the collections it links, which must all be allowlisted. Queries run inside a stream transaction, so `OPTIONS { waitForSync: true }` is unavailable and freshly written documents become visible only once the view has indexed them.
 - Query time, memory, row count, serialized response size, buffered write-result size, cursor TTL, and active cursor count are capped.
 - Revision-safe document CRUD and arbitrary write-capable AQL are separate opt-in capabilities.
 - Database and collection allowlists can further restrict the ArangoDB user's permissions.
@@ -113,7 +116,7 @@ It emits a warning because CLI secrets may be visible to other local processes.
 | `ARANGO_MCP_MAX_WRITE_SPOOL_BYTES` | `16777216` | Maximum total bytes buffered for all `readWriteQuery` results before commit |
 | `ARANGO_MCP_MAX_RUNTIME` | `30` | ArangoDB query runtime limit in seconds |
 | `ARANGO_MCP_MEMORY_LIMIT` | `134217728` | ArangoDB query memory limit in bytes |
-| `ARANGO_MCP_REQUEST_TIMEOUT` | `35000` | arangojs request timeout in milliseconds |
+| `ARANGO_MCP_REQUEST_TIMEOUT` | max runtime + 5000 | arangojs request timeout in milliseconds; defaults to `ARANGO_MCP_MAX_RUNTIME` × 1000 plus 5000 ms |
 | `ARANGO_MCP_CURSOR_TTL` | `30` | Continuation cursor lifetime in seconds |
 | `ARANGO_MCP_MAX_ACTIVE_CURSORS` | `32` | Maximum simultaneous cursors |
 | `ARANGO_TLS_CA_FILE` | None | PEM CA file for HTTPS connections |
@@ -161,6 +164,8 @@ users.grantDatabase("mcp_reader", "analytics", "ro");
 users.grantCollection("mcp_reader", "analytics", "events", "ro");
 users.grantCollection("mcp_reader", "analytics", "accounts", "ro");
 ```
+
+The account does not need any access to `_system`: `listDatabases` reads the user-visible database list, and `healthCheck` reads the version from a database the user can see.
 
 Keep the database account read-only even when the MCP server's allowlists are configured; the two controls are complementary.
 
