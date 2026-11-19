@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- Run the CI integration job on Node.js 26 LTS, pin GitHub Actions to commit digests, and update the development ArangoDB image to 3.12.13.
+
 ## 3.0.0
 
 - **Breaking:** remove `bytes`, empty `warnings`, and unrequested `stats` from query pages. `readQuery` and `readWriteQuery` accept `includeStats`; streamed reads report statistics only when the whole result fits the first page, while `readWriteQuery` reports them on its first page and always returns `writesExecuted` and `writesIgnored` there.
